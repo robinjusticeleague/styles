@@ -3,14 +3,16 @@ use cssparser::serialize_identifier;
 use html5ever::tokenizer::{
     BufferQueue, TagKind, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts,
 };
+use lightningcss::stylesheet::{ParserOptions, PrinterOptions, StyleSheet};
 use lru::LruCache;
 use notify::{event::ModifyKind, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use once_cell::sync::Lazy;
 use similar::{ChangeTag, TextDiff};
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::fmt::Write;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::{mpsc, Mutex};
@@ -241,15 +243,27 @@ fn format_duration(duration: std::time::Duration) -> String {
 }
 
 fn update_css_file(classes: &HashSet<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let file = File::create("style.css")?;
-    let mut writer = BufWriter::new(file);
+    let mut sorted_classes: Vec<_> = classes.iter().collect();
+    sorted_classes.sort();
 
-    for class in classes {
-        let mut escaped = String::new();
-        serialize_identifier(class, &mut escaped).unwrap();
-        writeln!(writer, ".{} {{ display: flex; }}", escaped)?;
+    let mut raw_css = String::with_capacity(classes.len() * 40);
+    for class in sorted_classes {
+        let mut escaped_class = String::new();
+        serialize_identifier(class, &mut escaped_class).map_err(|_| "Failed to escape CSS identifier")?;
+        writeln!(&mut raw_css, ".{} {{ display: flex; }}", escaped_class)
+            .map_err(|_| "Failed to write to CSS string")?;
     }
 
-    writer.flush()?;
+    let stylesheet = StyleSheet::parse(&raw_css, ParserOptions::default())
+        .map_err(|e| e.to_string())?;
+
+    let printer_options = PrinterOptions {
+        minify: false,
+        ..PrinterOptions::default()
+    };
+
+    let result = stylesheet.to_css(printer_options)?;
+    fs::write("style.css", result.code)?;
+
     Ok(())
 }

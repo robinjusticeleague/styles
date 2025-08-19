@@ -1,3 +1,11 @@
-.\+card\(flex\ text-md\ p-4\) { display: flex; }
-.m-69 { display: flex; }
-.text-5xl { display: flex; }
+.\+card\(flex\ text-md\ p-4\) {
+  display: flex;
+}
+
+.m-74 {
+  display: flex;
+}
+
+.text-5xl {
+  display: flex;
+}
