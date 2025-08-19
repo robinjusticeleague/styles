@@ -6,12 +6,11 @@ use html5ever::tokenizer::{
 use lru::LruCache;
 use notify::{event::ModifyKind, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use once_cell::sync::Lazy;
-use rayon::prelude::*;
 use similar::{ChangeTag, TextDiff};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::{mpsc, Mutex};
@@ -191,10 +190,14 @@ fn process_html_file(
     timer = Instant::now();
     let cached_classes: HashSet<_> = class_cache.iter().map(|(k, _)| k.clone()).collect();
     let added: HashSet<_> = new_classes.difference(&cached_classes).cloned().collect();
+    let removed: HashSet<_> = cached_classes.difference(&new_classes).cloned().collect();
     let diff_duration = timer.elapsed();
 
-    if !added.is_empty() {
+    if !added.is_empty() || !removed.is_empty() {
         timer = Instant::now();
+        for class in &removed {
+            class_cache.pop(class);
+        }
         for class in &added {
             class_cache.put(class.clone(), ());
         }
@@ -218,15 +221,9 @@ fn process_html_file(
         println!(
             "Processed: {} added, {} removed | {}",
             format!("{}", added.len()).green(),
-            format!("0").red(),
+            format!("{}", removed.len()).red(),
             timing_details.bright_black()
         );
-    } else if is_initial_run && new_classes.len() != class_cache.len() {
-        // Handle initial run where classes might have been removed from HTML
-        // before the watcher started.
-        let all_classes_to_write: HashSet<_> = class_cache.iter().map(|(k, _v)| k.clone()).collect();
-        update_css_file(&all_classes_to_write)?;
-        println!("{}", "Initial scan complete. Style file synchronized.".blue());
     } else if is_initial_run {
         println!("{}", "No initial changes to classnames detected.".blue());
     }
@@ -244,15 +241,15 @@ fn format_duration(duration: std::time::Duration) -> String {
 }
 
 fn update_css_file(classes: &HashSet<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let css_content: String = classes
-        .par_iter()
-        .map(|class| {
-            let mut escaped = String::new();
-            serialize_identifier(class, &mut escaped).unwrap();
-            format!(".{} {{ display: flex; }}\n", escaped)
-        })
-        .collect();
+    let file = File::create("style.css")?;
+    let mut writer = BufWriter::new(file);
 
-    fs::write("style.css", css_content)?;
+    for class in classes {
+        let mut escaped = String::new();
+        serialize_identifier(class, &mut escaped).unwrap();
+        writeln!(writer, ".{} {{ display: flex; }}", escaped)?;
+    }
+
+    writer.flush()?;
     Ok(())
 }
