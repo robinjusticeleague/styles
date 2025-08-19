@@ -1,4 +1,6 @@
-.text-2xl { display: flex; }
-.grid { display: flex; }
+.text-5xl { display: flex; }
+.text-3xl { display: flex; }
 .m-45 { display: flex; }
+.\\\+card\\\(flex\\\ text-md\\\ p-4\\\) { display: flex; }
 .\+card\(flex\ text-md\ p-4\) { display: flex; }
+.text-1xl { display: flex; }
