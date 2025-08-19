@@ -8,18 +8,21 @@ use memmap2::MmapOptions;
 use notify_debouncer_full::new_debouncer;
 use once_cell::sync::Lazy;
 use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Write};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::str;
-use std::sync::mpsc::channel;
+use std::sync::{mpsc::channel, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::System;
 use tendril::{fmt::UTF8, Tendril};
 
 static CACHE_SIZE: Lazy<NonZeroUsize> = Lazy::new(|| NonZeroUsize::new(1000).unwrap());
+static FILE_HASH_CACHE: Lazy<Mutex<u64>> = Lazy::new(|| Mutex::new(0));
 
 struct ClassExtractor {
     classes: RefCell<HashSet<String>>,
@@ -146,6 +149,12 @@ fn read_existing_classes(
     Ok(())
 }
 
+fn calculate_hash(data: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    data.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn process_html_file(
     html_path: &str,
     class_cache: &mut LruCache<String, ()>,
@@ -153,15 +162,25 @@ fn process_html_file(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let total_start = Instant::now();
 
-    let mut timer = Instant::now();
     let file = File::open(html_path)?;
     let mmap = unsafe { MmapOptions::new().map(&file)? };
+
+    let new_hash = calculate_hash(&mmap);
+    let mut last_hash = FILE_HASH_CACHE.lock().unwrap();
+
+    if !is_initial_run && new_hash == *last_hash {
+        return Ok(());
+    }
+    *last_hash = new_hash;
+
+    let mut timer = Instant::now();
     let html_str = str::from_utf8(&mmap)?;
 
     let sink = ClassExtractor {
         classes: RefCell::new(HashSet::new()),
     };
-    let tokenizer = Tokenizer::new(sink, TokenizerOpts::default());
+    #[allow(unused_mut)]
+    let mut tokenizer = Tokenizer::new(sink, TokenizerOpts::default());
     let mut buffer = BufferQueue::default();
     let tendril = Tendril::<UTF8>::from_slice(html_str);
     buffer.push_back(tendril.try_reinterpret().unwrap());

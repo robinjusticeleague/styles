@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "crates/compiler",
+    "crates/include_sass",
+    "crates/lib",
+]
+
+[profile.release]
+debug = 1
+panic = "abort"
+lto = true
+codegen-units = 1
+
+[profile.small]
+inherits = 'release'
+opt-level = 'z'
+lto = true
+codegen-units = 1
+panic = 'abort'
+strip = true
+
