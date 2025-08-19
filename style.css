@@ -1,8 +1,5 @@
+.text-2xl { display: flex; }
+.op { display: flex; }
 .\+card\(flex\ text-md\ p-4\) { display: flex; }
-.hi { display: flex; }
+.m-45 { display: flex; }
 .hidden { display: flex; }
-.m-21 { display: flex; }
-.no { display: flex; }
-.oi { display: flex; }
-.text-xl { display: flex; }
-.yes { display: flex; }

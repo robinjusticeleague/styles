@@ -10,9 +10,9 @@ use once_cell::sync::Lazy;
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
+use std::fmt::Write;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
-use std::io::{BufWriter, Write};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::str;
@@ -243,17 +243,15 @@ fn format_duration(duration: Duration) -> String {
 }
 
 fn update_css_file(classes: &HashSet<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let file = File::create("style.css")?;
-    let mut writer = BufWriter::new(file);
-    let mut sorted_classes: Vec<_> = classes.iter().collect();
-    sorted_classes.sort();
+    let mut css_content = String::with_capacity(classes.len() * 40);
 
-    for class in sorted_classes {
+    for class in classes {
         let mut escaped_class = String::new();
         serialize_identifier(class, &mut escaped_class)
             .expect("Failed to serialize CSS identifier");
-        writeln!(writer, ".{} {{ display: flex; }}", escaped_class)?;
+        writeln!(&mut css_content, ".{} {{ display: flex; }}", escaped_class)?;
     }
-    writer.flush()?;
+
+    fs::write("style.css", css_content)?;
     Ok(())
 }
