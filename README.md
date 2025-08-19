@@ -1,6 +1,8 @@
 # Dx
 Enhance Developer Experience
 
+Figured out how to use scss in dx-styles
+
 git config --global user.name "najmus-sakib-hossain"
 git config --global user.email "manfromexistence@proton.me"
 
