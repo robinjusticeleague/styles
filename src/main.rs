@@ -7,7 +7,7 @@ use lightningcss::stylesheet::{ParserOptions, PrinterOptions, StyleSheet};
 use lru::LruCache;
 use notify::{event::ModifyKind, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use once_cell::sync::Lazy;
-use similar::{ChangeTag, TextDiff};
+use regex::Regex;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -21,7 +21,8 @@ use sysinfo::System;
 use tendril::{fmt::UTF8, Tendril};
 
 static CACHE_SIZE: Lazy<NonZeroUsize> = Lazy::new(|| NonZeroUsize::new(1000).unwrap());
-static FILE_CACHE: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
+static HTML_CACHE: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
+static CSS_CACHE: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 
 struct ClassExtractor {
     classes: RefCell<HashSet<String>>,
@@ -95,16 +96,19 @@ fn print_system_info() {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", "Starting DX HTML Class Parser...".cyan());
+    println!("{}", "Starting DX Style Engine...".cyan());
     print_system_info();
 
     if !Path::new("style.css").exists() {
         File::create("style.css")?;
     }
+    if !Path::new("index.html").exists() {
+        File::create("index.html")?;
+    }
 
     let mut class_cache: LruCache<String, ()> = LruCache::new(*CACHE_SIZE);
     read_existing_classes("style.css", &mut class_cache)?;
-    process_html_file("index.html", &mut class_cache, true)?;
+    rebuild_styles(&mut class_cache, true)?;
 
     let (tx, rx) = mpsc::channel();
 
@@ -120,10 +124,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     watcher.watch(Path::new("index.html"), RecursiveMode::NonRecursive)?;
+    watcher.watch(Path::new("style.css"), RecursiveMode::NonRecursive)?;
 
-    println!("{}", "Watching index.html for changes...".cyan());
+    println!("{}", "Watching index.html and style.css for changes...".cyan());
     while rx.recv().is_ok() {
-        process_html_file("index.html", &mut class_cache, false)?;
+        rebuild_styles(&mut class_cache, false)?;
     }
 
     Ok(())
@@ -152,28 +157,24 @@ fn read_existing_classes(
     Ok(())
 }
 
-fn process_html_file(
-    html_path: &str,
+fn rebuild_styles(
     class_cache: &mut LruCache<String, ()>,
     is_initial_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let total_start = Instant::now();
 
-    let new_content = fs::read_to_string(html_path)?;
-    let mut old_content_guard = FILE_CACHE.lock().unwrap();
+    let html_content = fs::read_to_string("index.html")?;
+    let css_content = fs::read_to_string("style.css")?;
 
-    if !is_initial_run {
-        let diff = TextDiff::from_lines(&*old_content_guard, &new_content);
-        let change_count = diff
-            .iter_all_changes()
-            .filter(|c| c.tag() != ChangeTag::Equal)
-            .count();
-        if change_count == 0 {
-            return Ok(());
-        }
+    let mut old_html = HTML_CACHE.lock().unwrap();
+    let mut old_css = CSS_CACHE.lock().unwrap();
+
+    let html_changed = *old_html != html_content;
+    let css_changed = *old_css != css_content;
+
+    if !is_initial_run && !html_changed && !css_changed {
+        return Ok(());
     }
-    *old_content_guard = new_content.clone();
-    drop(old_content_guard);
 
     let mut timer = Instant::now();
     let sink = ClassExtractor {
@@ -182,7 +183,7 @@ fn process_html_file(
     #[allow(unused_mut)]
     let mut tokenizer = Tokenizer::new(sink, TokenizerOpts::default());
     let mut buffer = BufferQueue::default();
-    let tendril = Tendril::<UTF8>::from_slice(&new_content);
+    let tendril = Tendril::<UTF8>::from_slice(&html_content);
     buffer.push_back(tendril.try_reinterpret().unwrap());
     let _ = tokenizer.feed(&mut buffer);
     tokenizer.end();
@@ -195,40 +196,38 @@ fn process_html_file(
     let removed: HashSet<_> = cached_classes.difference(&new_classes).cloned().collect();
     let diff_duration = timer.elapsed();
 
-    if !added.is_empty() || !removed.is_empty() {
-        timer = Instant::now();
-        for class in &removed {
-            class_cache.pop(class);
-        }
-        for class in &added {
-            class_cache.put(class.clone(), ());
-        }
-        let cache_update_duration = timer.elapsed();
-
-        let all_classes_to_write: HashSet<_> = class_cache.iter().map(|(k, _v)| k.clone()).collect();
-
-        timer = Instant::now();
-        update_css_file(&all_classes_to_write)?;
-        let write_duration = timer.elapsed();
-        let total_duration = total_start.elapsed();
-
-        let timing_details = format!(
-            "Total: {} (Parse/Extract: {}, Diff: {}, Cache: {}, Write: {})",
-            format_duration(total_duration),
-            format_duration(parse_extract_duration),
-            format_duration(diff_duration),
-            format_duration(cache_update_duration),
-            format_duration(write_duration)
-        );
-        println!(
-            "Processed: {} added, {} removed | {}",
-            format!("{}", added.len()).green(),
-            format!("{}", removed.len()).red(),
-            timing_details.bright_black()
-        );
-    } else if is_initial_run {
-        println!("{}", "No initial changes to classnames detected.".blue());
+    timer = Instant::now();
+    for class in &removed {
+        class_cache.pop(class);
     }
+    for class in &added {
+        class_cache.put(class.clone(), ());
+    }
+    let cache_update_duration = timer.elapsed();
+
+    let all_classes_to_write: HashSet<_> = class_cache.iter().map(|(k, _v)| k.clone()).collect();
+    timer = Instant::now();
+    update_css_file(&all_classes_to_write, &css_content)?;
+    let write_duration = timer.elapsed();
+    let total_duration = total_start.elapsed();
+
+    let timing_details = format!(
+        "Total: {} (Parse/Extract: {}, Diff: {}, Cache: {}, Write: {})",
+        format_duration(total_duration),
+        format_duration(parse_extract_duration),
+        format_duration(diff_duration),
+        format_duration(cache_update_duration),
+        format_duration(write_duration)
+    );
+    println!(
+        "Processed: {} added, {} removed | {}",
+        format!("{}", added.len()).green(),
+        format!("{}", removed.len()).red(),
+        timing_details.bright_black()
+    );
+
+    *old_html = html_content;
+    *old_css = css_content;
 
     Ok(())
 }
@@ -242,28 +241,51 @@ fn format_duration(duration: std::time::Duration) -> String {
     }
 }
 
-fn update_css_file(classes: &HashSet<String>) -> Result<(), Box<dyn std::error::Error>> {
+fn update_css_file(classes: &HashSet<String>, css_content: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut sorted_classes: Vec<_> = classes.iter().collect();
     sorted_classes.sort();
 
-    let mut raw_css = String::with_capacity(classes.len() * 40);
+    let mut utility_css = String::with_capacity(classes.len() * 40);
     for class in sorted_classes {
         let mut escaped_class = String::new();
-        serialize_identifier(class, &mut escaped_class).map_err(|_| "Failed to escape CSS identifier")?;
-        writeln!(&mut raw_css, ".{} {{ display: flex; }}", escaped_class)
-            .map_err(|_| "Failed to write to CSS string")?;
+        serialize_identifier(class, &mut escaped_class).unwrap();
+        writeln!(&mut utility_css, ".{} {{ display: flex; }}", escaped_class)?;
     }
 
-    let stylesheet = StyleSheet::parse(&raw_css, ParserOptions::default())
-        .map_err(|e| e.to_string())?;
-
-    let printer_options = PrinterOptions {
-        minify: false,
-        ..PrinterOptions::default()
+    let re = Regex::new(r"(?s)/\* Dx\s*(.*?)\s*\*/")?;
+    
+    let scss_code = if let Some(captures) = re.captures(css_content) {
+        captures.get(1).unwrap().as_str()
+    } else {
+        ""
     };
 
-    let result = stylesheet.to_css(printer_options)?;
-    fs::write("style.css", result.code)?;
+    let compiled_scss = if !scss_code.trim().is_empty() {
+        grass::from_string(scss_code.to_string(), &grass::Options::default())?
+    } else {
+        String::new()
+    };
+
+    let generated_content = format!("{}\n{}", compiled_scss, utility_css);
+
+    let formatted_generated_css = if !generated_content.trim().is_empty() {
+        let stylesheet = StyleSheet::parse(&generated_content, ParserOptions::default())
+            .map_err(|e| e.to_string())?;
+        let printer_options = PrinterOptions {
+            minify: false,
+            ..PrinterOptions::default()
+        };
+        stylesheet.to_css(printer_options)?.code
+    } else {
+        String::new()
+    };
+
+    let final_css_content = format!(
+        "{}\n\n/* Dx\n\n*/\n",
+        formatted_generated_css.trim()
+    );
+
+    fs::write("style.css", final_css_content)?;
 
     Ok(())
 }
