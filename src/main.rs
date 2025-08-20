@@ -1,70 +1,63 @@
 use colored::Colorize;
 use cssparser::serialize_identifier;
+use memmap2::Mmap;
 use notify_debouncer_full::new_debouncer;
 use once_cell::sync::Lazy;
+use rayon::prelude::*;
+use regex::Regex;
 use seahash::SeaHasher;
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions, read_to_string};
+use std::fs::{self, File};
 use std::hash::Hasher;
-use std::io::Write as IoWrite;
+use std::io::{BufWriter, Write};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tl::ParserOptions;
+use sysinfo::System;
 
-static CSS_CLASS_RE: Lazy<tl::ParserOptions> = Lazy::new(|| ParserOptions::default());
+static CLASS_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"class="([^"]*)""#).unwrap());
+static LAST_HTML_HASH: Mutex<u64> = Mutex::new(0);
 
-struct AppState {
-    html_hash: u64,
-    css_hash: u64,
-    class_cache: HashSet<String>,
+fn print_system_info() {
+    let mut sys = System::new_all();
+    sys.refresh_memory();
+    let total_memory = sys.total_memory() / 1024 / 1024;
+    let available_memory = sys.available_memory() / 1024 / 1024;
+    let core_count = sys.cpus().len();
+    println!(
+        "{}",
+        format!(
+            "System Info: {} Cores, {}MB/{}MB Available Memory",
+            core_count, available_memory, total_memory
+        )
+        .dimmed()
+    );
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", "Starting DX Style Engine...".cyan());
+    print_system_info();
 
     if !Path::new("style.css").exists() {
-        File::create("style.css")?;
+        fs::write("style.css", "")?;
     }
     if !Path::new("index.html").exists() {
-        File::create("index.html")?;
+        fs::write("index.html", "")?;
     }
 
-    let app_state = Arc::new(Mutex::new(AppState {
-        html_hash: 0,
-        css_hash: 0,
-        class_cache: HashSet::with_capacity(2048),
-    }));
-
-    // Initialize class cache with existing classes from style.css
-    {
-        let css_content = read_to_string("style.css")?;
-        let mut state_guard = app_state.lock().unwrap();
-        let dom = tl::parse(&css_content, *CSS_CLASS_RE)?;
-        for node in dom.query_selector(".") {
-            if let Some(tag) = node.as_tag() {
-                if let Some(class) = tag.attributes().get("class") {
-                    for cls in class.as_utf8_str().split_whitespace() {
-                        state_guard.class_cache.insert(cls.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    rebuild_styles(app_state.clone(), true)?;
+    rebuild_styles(true)?;
 
     let (tx, rx) = std::sync::mpsc::channel();
     let mut debouncer = new_debouncer(Duration::from_millis(50), None, tx)?;
-    debouncer.watch(Path::new("index.html"), notify::RecursiveMode::NonRecursive)?;
-    debouncer.watch(Path::new("style.css"), notify::RecursiveMode::NonRecursive)?;
 
-    println!("{}", "Watching index.html and style.css for changes...".cyan());
+    debouncer.watch(Path::new("index.html"), notify::RecursiveMode::NonRecursive)?;
+
+    println!("{}", "Watching index.html for changes...".cyan());
 
     for res in rx {
         match res {
             Ok(_) => {
-                if let Err(e) = rebuild_styles(app_state.clone(), false) {
+                if let Err(e) = rebuild_styles(false) {
                     eprintln!("{} {}", "Error rebuilding styles:".red(), e);
                 }
             }
@@ -75,126 +68,118 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn rebuild_styles(
-    state: Arc<Mutex<AppState>>,
-    is_initial_run: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let html_content = read_to_string("index.html")?;
-    let css_content = read_to_string("style.css")?;
+fn rebuild_styles(is_initial_run: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let html_file = File::open("index.html")?;
+    let html_mmap = unsafe { Mmap::map(&html_file)? };
 
-    let mut html_hasher = SeaHasher::new();
-    html_hasher.write(html_content.as_bytes());
-    let new_html_hash = html_hasher.finish();
-
-    let mut css_hasher = SeaHasher::new();
-    css_hasher.write(css_content.as_bytes());
-    let new_css_hash = css_hasher.finish();
-
-    let (html_changed, css_changed) = {
-        let mut state_guard = state.lock().unwrap();
-        let html_changed = state_guard.html_hash != new_html_hash;
-        let css_changed = state_guard.css_hash != new_css_hash;
-
-        if html_changed {
-            state_guard.html_hash = new_html_hash;
-        }
-        if css_changed {
-            state_guard.css_hash = new_css_hash;
-        }
-
-        (html_changed, css_changed)
+    let new_html_hash = {
+        let mut hasher = SeaHasher::new();
+        hasher.write(&html_mmap);
+        hasher.finish()
     };
 
-    if !is_initial_run && !html_changed && !css_changed {
+    let html_changed = {
+        let mut last_hash = LAST_HTML_HASH.lock().unwrap();
+        if *last_hash != new_html_hash {
+            *last_hash = new_html_hash;
+            true
+        } else {
+            false
+        }
+    };
+
+    if !is_initial_run && !html_changed {
         return Ok(());
     }
 
     let total_start = Instant::now();
-    let mut find_and_cache_duration = Duration::ZERO;
-    let mut css_write_duration = Duration::ZERO;
-    let mut added_count = 0;
 
-    if is_initial_run || html_changed || css_changed {
-        let timer = Instant::now();
-        let mut css_to_append = String::with_capacity(256);
-        let mut new_classes = Vec::with_capacity(16);
+    let html_content = std::str::from_utf8(&html_mmap)?;
+    let timer = Instant::now();
 
-        // Update class cache if style.css changed
-        if css_changed {
-            let mut state_guard = state.lock().unwrap();
-            state_guard.class_cache.clear();
-            let dom = tl::parse(&css_content, *CSS_CLASS_RE)?;
-            for node in dom.query_selector(".") {
-                if let Some(tag) = node.as_tag() {
-                    if let Some(class) = tag.attributes().get("class") {
-                        for cls in class.as_utf8_str().split_whitespace() {
-                            state_guard.class_cache.insert(cls.to_string());
+    let captures: Vec<_> = CLASS_RE.captures_iter(html_content).collect();
+
+    let all_html_classes: HashSet<String> = captures
+        .par_iter()
+        .fold(
+            || HashSet::with_capacity(256),
+            |mut acc, cap| {
+                let group = cap.get(1).unwrap();
+                let class_str = group.as_str();
+                let mut start = 0;
+                let mut paren_level = 0;
+
+                for (i, c) in class_str.char_indices() {
+                    match c {
+                        '(' => paren_level += 1,
+                        ')' => {
+                            if paren_level > 0 {
+                                paren_level -= 1;
+                            }
                         }
+                        ' ' | '\t' | '\n' | '\r' if paren_level == 0 => {
+                            if i > start {
+                                acc.insert(class_str[start..i].to_string());
+                            }
+                            start = i + c.len_utf8();
+                        }
+                        _ => {}
                     }
                 }
-            }
-        }
-
-        // Collect classes from index.html using tl
-        let dom = tl::parse(&html_content, ParserOptions::default())?;
-        for node in dom.query_selector("*[class]") {
-            if let Some(tag) = node.as_tag() {
-                if let Some(class) = tag.attributes().get("class") {
-                    for cls in class.as_utf8_str().split_whitespace() {
-                        new_classes.push(cls.to_string());
-                    }
+                if start < class_str.len() {
+                    acc.insert(class_str[start..].to_string());
                 }
-            }
-        }
+                acc
+            },
+        )
+        .reduce(
+            || HashSet::with_capacity(1024),
+            |mut a, b| {
+                a.extend(b);
+                a
+            },
+        );
 
-        // Append only new classes
-        {
-            let mut state_guard = state.lock().unwrap();
-            for class in new_classes {
-                if state_guard.class_cache.insert(class.clone()) {
-                    let mut escaped_class = String::with_capacity(class.len());
-                    serialize_identifier(&class, &mut escaped_class).unwrap();
-                    css_to_append.push('.');
-                    css_to_append.push_str(&escaped_class);
-                    css_to_append.push_str(" {\n  display: flex;\n}\n\n");
-                    added_count += 1;
-                }
-            }
-        }
+    let parse_duration = timer.elapsed();
+    let write_timer = Instant::now();
 
-        find_and_cache_duration = timer.elapsed();
+    let mut sorted_classes: Vec<_> = all_html_classes.into_iter().collect();
+    sorted_classes.sort_unstable();
 
-        if added_count > 0 {
-            let write_timer = Instant::now();
-            let mut file = OpenOptions::new().append(true).open("style.css")?;
-            file.write_all(css_to_append.as_bytes())?;
-            css_write_duration = write_timer.elapsed();
-        }
+    let file = File::create("style.css")?;
+    let mut writer = BufWriter::with_capacity(sorted_classes.len() * 50, file);
+
+    for class in &sorted_classes {
+        let mut escaped_class = String::new();
+        serialize_identifier(class, &mut escaped_class).unwrap();
+        write!(
+            writer,
+            ".{} {{\n  display: flex;\n}}\n\n",
+            escaped_class
+        )?;
     }
+    writer.flush()?;
+    let write_duration = write_timer.elapsed();
 
     let total_duration = total_start.elapsed();
+    let class_count = sorted_classes.len();
 
-    if is_initial_run || added_count > 0 {
-        let timing_details = format!(
-            "Processed: {} appended | Total: {} (Parse & Append Prep: {}, CSS Append: {})",
-            format!("{}", added_count).green(),
-            format_duration(total_duration),
-            format_duration(find_and_cache_duration),
-            format_duration(css_write_duration)
-        );
-        println!("{}", timing_details);
-    }
-
-    if total_duration.as_micros() < 200 {
-        println!("{}", "Task completed in less than 200µs!".green());
-    } else {
-        println!("{}", "Task took longer than 200µs.".yellow());
-    }
+    let timing_details = format!(
+        "Total: {} (Parse: {}, Write: {})",
+        format_duration(total_duration),
+        format_duration(parse_duration),
+        format_duration(write_duration)
+    );
+    println!(
+        "Generated: {} classes | {}",
+        format!("{}", class_count).green(),
+        timing_details.bright_black()
+    );
 
     Ok(())
 }
 
-fn format_duration(duration: Duration) -> String {
+fn format_duration(duration: std::time::Duration) -> String {
     let micros = duration.as_micros();
     if micros > 999 {
         format!("{:.2}ms", micros as f64 / 1000.0)

@@ -2,6 +2,10 @@
   display: flex;
 }
 
+.blue {
+  display: flex;
+}
+
 .green {
   display: flex;
 }
@@ -26,7 +30,15 @@
   display: flex;
 }
 
+.text-mg {
+  display: flex;
+}
+
 .whatisup {
+  display: flex;
+}
+
+.yellow {
   display: flex;
 }
 
