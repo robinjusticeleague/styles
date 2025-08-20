@@ -225,12 +225,12 @@ fn rebuild_styles(
         }
     }
 
-    let timer = Instant::now();
-    let mut final_css = String::new();
+    let css_write_timer = Instant::now();
     let state_guard = state.lock().unwrap();
-    let mut sorted_classes: Vec<_> = state_guard.utility_css_cache.keys().collect();
-    sorted_classes.sort();
-    for class_name in sorted_classes {
+    let capacity = state_guard.class_cache.len() * 40;
+    let mut final_css = String::with_capacity(capacity);
+
+    for class_name in &state_guard.class_cache {
         if let Some(rule) = state_guard.utility_css_cache.get(class_name) {
             final_css.push_str(rule);
         }
@@ -242,18 +242,18 @@ fn rebuild_styles(
         let mut file = OpenOptions::new().write(true).truncate(true).open("style.css")?;
         file.write_all(final_css.as_bytes())?;
     }
-    let write_duration = timer.elapsed();
+    let css_write_duration = css_write_timer.elapsed();
 
     let total_duration = total_start.elapsed();
 
     if is_initial_run || added_count > 0 || removed_count > 0 {
         let timing_details = format!(
-            "Total: {} (HTML Parse: {}, Diff: {}, Cache: {}, Write: {})",
+            "Total: {} (HTML Parse: {}, Diff: {}, Cache: {}, CSS Write: {})",
             format_duration(total_duration),
             format_duration(parse_extract_duration),
             format_duration(diff_duration),
             format_duration(cache_update_duration),
-            format_duration(write_duration)
+            format_duration(css_write_duration)
         );
         println!(
             "Processed: {} added, {} removed | {}",
