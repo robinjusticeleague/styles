@@ -2,6 +2,23 @@
 Enhance Developer Experience
 
 Figured out how to use scss in dx-styles
+[dependencies]
+# For fast JS/TS parsing
+swc_ecma_parser = "0.141.2"
+swc_common = "0.33.10"
+
+# For handling project configs (package.json, etc.)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# For beautiful error handling
+thiserror = "1.0"
+
+# For code generation templating
+tera = "1.19"
+
+# For walking file directories
+walkdir = "2.5"
 
 git config --global user.name "najmus-sakib-hossain"
 git config --global user.email "manfromexistence@proton.me"
