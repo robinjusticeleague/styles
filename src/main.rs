@@ -55,8 +55,7 @@ impl TokenSink for ClassExtractor {
                                 }
                                 ' ' | '\t' | '\n' | '\r' if paren_level == 0 => {
                                     if !current_class.is_empty() {
-                                        classes.insert(current_class.clone());
-                                        current_class.clear();
+                                        classes.insert(std::mem::take(&mut current_class));
                                     }
                                 }
                                 _ => {
@@ -164,7 +163,7 @@ fn rebuild_styles(
 
     let timer = Instant::now();
     let sink = ClassExtractor {
-        classes: RefCell::new(HashSet::new()),
+        classes: RefCell::new(HashSet::with_capacity(256)),
     };
     let tokenizer = Tokenizer::new(sink, TokenizerOpts::default());
     let mut buffer = BufferQueue::default();
@@ -206,14 +205,14 @@ fn rebuild_styles(
         let cache_update_duration = timer.elapsed();
 
         let css_write_timer = Instant::now();
-        let mut sorted_classes: Vec<_> = state_guard.utility_css_cache.keys().collect();
-        sorted_classes.sort_unstable();
+        let mut sorted_classes: Vec<_> = state_guard.utility_css_cache.keys().cloned().collect();
+        sorted_classes.par_sort_unstable();
 
         let file = File::create("style.css")?;
         let mut writer = BufWriter::with_capacity(state_guard.utility_css_cache.len() * 50, file);
 
         for class_name in sorted_classes {
-            if let Some(rule) = state_guard.utility_css_cache.get(class_name) {
+            if let Some(rule) = state_guard.utility_css_cache.get(&class_name) {
                 writer.write_all(rule.as_bytes())?;
             }
         }
