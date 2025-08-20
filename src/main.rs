@@ -7,7 +7,7 @@ use memmap2::Mmap;
 use notify_debouncer_full::new_debouncer;
 use seahash::SeaHasher;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{File, OpenOptions};
 use std::hash::Hasher;
 use std::io::Write as IoWrite;
@@ -21,7 +21,7 @@ struct AppState {
     html_hash: u64,
     css_hash: u64,
     class_cache: BTreeSet<String>,
-    utility_css_cache: HashMap<String, String>,
+    utility_css_cache: BTreeMap<String, String>,
 }
 
 struct ClassExtractor {
@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         html_hash: 0,
         css_hash: 0,
         class_cache: BTreeSet::new(),
-        utility_css_cache: HashMap::new(),
+        utility_css_cache: BTreeMap::new(),
     }));
 
     rebuild_styles(app_state.clone(), true)?;
@@ -218,7 +218,7 @@ fn rebuild_styles(
             for class in added.iter() {
                 let mut escaped_class = String::new();
                 serialize_identifier(class.as_str(), &mut escaped_class).unwrap();
-                let rule = format!(".{} {{\n  display: flex;\n}}\n", escaped_class);
+                let rule = format!(".{} {{\n  display: flex;\n}}\n\n", escaped_class);
                 state_guard.utility_css_cache.insert(class.clone(), rule);
             }
             cache_update_duration = timer.elapsed();
@@ -227,13 +227,11 @@ fn rebuild_styles(
 
     let css_write_timer = Instant::now();
     let state_guard = state.lock().unwrap();
-    let capacity = state_guard.class_cache.len() * 40;
+    let capacity = state_guard.utility_css_cache.len() * 40;
     let mut final_css = String::with_capacity(capacity);
 
-    for class_name in &state_guard.class_cache {
-        if let Some(rule) = state_guard.utility_css_cache.get(class_name) {
-            final_css.push_str(rule);
-        }
+    for rule in state_guard.utility_css_cache.values() {
+        final_css.push_str(rule);
     }
     drop(state_guard);
 
