@@ -1,189 +1,86 @@
-use colored::Colorize;
-use cssparser::serialize_identifier;
-use memmap2::Mmap;
-use notify_debouncer_full::new_debouncer;
-use once_cell::sync::Lazy;
-use rayon::prelude::*;
+use notify::{EventKind, RecursiveMode};
+use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use regex::Regex;
-use seahash::SeaHasher;
 use std::collections::HashSet;
-use std::fs::{self, File};
-use std::hash::Hasher;
-use std::io::{BufWriter, Write};
+use std::error::Error;
+use std::fs::{read_to_string, write};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
-use sysinfo::System;
 
-static CLASS_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"class="([^"]*)""#).unwrap());
-static LAST_HTML_HASH: Mutex<u64> = Mutex::new(0);
+fn main() -> Result<(), Box<dyn Error>> {
+    let file_path = "index.html";
+    let output_path = "dummy.css";
 
-fn print_system_info() {
-    let mut sys = System::new_all();
-    sys.refresh_memory();
-    let total_memory = sys.total_memory() / 1024 / 1024;
-    let available_memory = sys.available_memory() / 1024 / 1024;
-    let core_count = sys.cpus().len();
-    println!(
-        "{}",
-        format!(
-            "System Info: {} Cores, {}MB/{}MB Available Memory",
-            core_count, available_memory, total_memory
-        )
-        .dimmed()
-    );
-}
+    let (tx, rx): (Sender<DebounceEventResult>, Receiver<DebounceEventResult>) = channel();
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", "Starting DX Style Engine...".cyan());
-    print_system_info();
+    let mut debouncer = new_debouncer(Duration::from_millis(200), None, tx)?;
 
-    if !Path::new("style.css").exists() {
-        fs::write("style.css", "")?;
-    }
-    if !Path::new("index.html").exists() {
-        fs::write("index.html", "")?;
-    }
+    debouncer.watch(Path::new(file_path), RecursiveMode::NonRecursive)?;
 
-    rebuild_styles(true)?;
+    let mut previous_classes: HashSet<String> = HashSet::new();
 
-    let (tx, rx) = std::sync::mpsc::channel();
-    let mut debouncer = new_debouncer(Duration::from_millis(50), None, tx)?;
+    // Compile regex for class names in HTML (class attributes or CSS selectors in <style>)
+    let re = Regex::new(r#"(?:class\s*=\s*["'](.*?)["']|\.([_a-zA-Z0-9-]+))"#)?;
 
-    debouncer.watch(Path::new("index.html"), notify::RecursiveMode::NonRecursive)?;
+    loop {
+        match rx.recv() {
+            Ok(Ok(events)) => {
+                for event in events {
+                    // Check if the event is a modify event and involves index.html
+                    if matches!(event.kind, EventKind::Modify(_))
+                        && event.paths.iter().any(|p| p.to_str() == Some(file_path))
+                    {
+                        let start = Instant::now();
 
-    println!("{}", "Watching index.html for changes...".cyan());
+                        let content = read_to_string(file_path)?;
 
-    for res in rx {
-        match res {
-            Ok(_) => {
-                if let Err(e) = rebuild_styles(false) {
-                    eprintln!("{} {}", "Error rebuilding styles:".red(), e);
-                }
-            }
-            Err(e) => eprintln!("{} {:?}", "Watch error:".red(), e),
-        }
-    }
+                        let mut new_classes: HashSet<String> = HashSet::new();
 
-    Ok(())
-}
-
-fn rebuild_styles(is_initial_run: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let html_file = File::open("index.html")?;
-    let html_mmap = unsafe { Mmap::map(&html_file)? };
-
-    let new_html_hash = {
-        let mut hasher = SeaHasher::new();
-        hasher.write(&html_mmap);
-        hasher.finish()
-    };
-
-    let html_changed = {
-        let mut last_hash = LAST_HTML_HASH.lock().unwrap();
-        if *last_hash != new_html_hash {
-            *last_hash = new_html_hash;
-            true
-        } else {
-            false
-        }
-    };
-
-    if !is_initial_run && !html_changed {
-        return Ok(());
-    }
-
-    let total_start = Instant::now();
-
-    let html_content = std::str::from_utf8(&html_mmap)?;
-    let timer = Instant::now();
-
-    let captures: Vec<_> = CLASS_RE.captures_iter(html_content).collect();
-
-    let all_html_classes: HashSet<String> = captures
-        .par_iter()
-        .fold(
-            || HashSet::with_capacity(256),
-            |mut acc, cap| {
-                let group = cap.get(1).unwrap();
-                let class_str = group.as_str();
-                let mut start = 0;
-                let mut paren_level = 0;
-
-                for (i, c) in class_str.char_indices() {
-                    match c {
-                        '(' => paren_level += 1,
-                        ')' => {
-                            if paren_level > 0 {
-                                paren_level -= 1;
+                        // Extract classes from class attributes and CSS selectors
+                        for cap in re.captures_iter(&content) {
+                            // Check class attribute (group 1)
+                            if let Some(cls_match) = cap.get(1) {
+                                // Split multiple classes in class="..."
+                                for cls in cls_match.as_str().split_whitespace() {
+                                    new_classes.insert(cls.to_string());
+                                }
+                            }
+                            // Check CSS selectors (group 2)
+                            if let Some(cls_match) = cap.get(2) {
+                                new_classes.insert(cls_match.as_str().to_string());
                             }
                         }
-                        ' ' | '\t' | '\n' | '\r' if paren_level == 0 => {
-                            if i > start {
-                                acc.insert(class_str[start..i].to_string());
-                            }
-                            start = i + c.len_utf8();
+
+                        let added = &new_classes - &previous_classes;
+                        let removed = &previous_classes - &new_classes;
+
+                        println!("Added classes: {:?}", added);
+                        println!("Removed classes: {:?}", removed);
+
+                        let mut dummy_css = String::new();
+                        for cls in &new_classes {
+                            dummy_css.push_str(&format!(".{} {{ display: flex; }}\n", cls));
                         }
-                        _ => {}
+
+                        write(output_path, dummy_css)?;
+
+                        previous_classes = new_classes;
+
+                        let elapsed = start.elapsed().as_micros();
+                        println!("Processing time: {} μs", elapsed);
                     }
                 }
-                if start < class_str.len() {
-                    acc.insert(class_str[start..].to_string());
+            }
+            Ok(Err(errors)) => {
+                for err in errors {
+                    println!("Watcher error: {:?}", err);
                 }
-                acc
-            },
-        )
-        .reduce(
-            || HashSet::with_capacity(1024),
-            |mut a, b| {
-                a.extend(b);
-                a
-            },
-        );
-
-    let parse_duration = timer.elapsed();
-    let write_timer = Instant::now();
-
-    let mut sorted_classes: Vec<_> = all_html_classes.into_iter().collect();
-    sorted_classes.sort_unstable();
-
-    let file = File::create("style.css")?;
-    let mut writer = BufWriter::with_capacity(sorted_classes.len() * 50, file);
-
-    for class in &sorted_classes {
-        let mut escaped_class = String::new();
-        serialize_identifier(class, &mut escaped_class).unwrap();
-        write!(
-            writer,
-            ".{} {{\n  display: flex;\n}}\n\n",
-            escaped_class
-        )?;
-    }
-    writer.flush()?;
-    let write_duration = write_timer.elapsed();
-
-    let total_duration = total_start.elapsed();
-    let class_count = sorted_classes.len();
-
-    let timing_details = format!(
-        "Total: {} (Parse: {}, Write: {})",
-        format_duration(total_duration),
-        format_duration(parse_duration),
-        format_duration(write_duration)
-    );
-    println!(
-        "Generated: {} classes | {}",
-        format!("{}", class_count).green(),
-        timing_details.bright_black()
-    );
-
-    Ok(())
-}
-
-fn format_duration(duration: std::time::Duration) -> String {
-    let micros = duration.as_micros();
-    if micros > 999 {
-        format!("{:.2}ms", micros as f64 / 1000.0)
-    } else {
-        format!("{}µs", micros)
+            }
+            Err(e) => {
+                println!("Channel error: {:?}", e);
+                break Ok(());
+            }
+        }
     }
 }
