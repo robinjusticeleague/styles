@@ -1,4 +1,5 @@
 use colored::Colorize;
+use cssparser::serialize_identifier;
 use memmap2::Mmap;
 use notify_debouncer_full::new_debouncer;
 use once_cell::sync::Lazy;
@@ -82,8 +83,6 @@ fn rebuild_styles(
     state: Arc<Mutex<AppState>>,
     is_initial_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let total_start = Instant::now();
-
     let html_file = File::open("index.html")?;
     let css_file = File::open("style.css")?;
     let html_mmap = unsafe { Mmap::map(&html_file)? };
@@ -116,6 +115,7 @@ fn rebuild_styles(
         return Ok(());
     }
 
+    let total_start = Instant::now();
     let mut find_and_cache_duration = Duration::ZERO;
     let mut css_write_duration = Duration::ZERO;
     let mut added_count = 0;
@@ -129,9 +129,42 @@ fn rebuild_styles(
 
         for cap in CLASS_RE.captures_iter(html_content) {
             if let Some(group) = cap.get(1) {
-                for class_name in group.as_str().split_whitespace() {
-                    if !class_name.is_empty() && state_guard.class_cache.insert(class_name.to_string()) {
-                        new_classes.push(class_name.to_string());
+                let class_str = group.as_str();
+                let mut current_class = String::new();
+                let mut paren_level = 0;
+
+                for c in class_str.chars() {
+                    match c {
+                        '(' => {
+                            paren_level += 1;
+                            current_class.push(c);
+                        }
+                        ')' => {
+                            if paren_level > 0 {
+                                paren_level -= 1;
+                            }
+                            current_class.push(c);
+                        }
+                        ' ' | '\t' | '\n' | '\r' => {
+                            if paren_level == 0 {
+                                if !current_class.is_empty() {
+                                    if state_guard.class_cache.insert(current_class.clone()) {
+                                        new_classes.push(current_class);
+                                    }
+                                    current_class = String::new();
+                                }
+                            } else {
+                                current_class.push(c);
+                            }
+                        }
+                        _ => {
+                            current_class.push(c);
+                        }
+                    }
+                }
+                if !current_class.is_empty() {
+                    if state_guard.class_cache.insert(current_class.clone()) {
+                        new_classes.push(current_class);
                     }
                 }
             }
@@ -144,7 +177,9 @@ fn rebuild_styles(
             let mut file = OpenOptions::new().append(true).open("style.css")?;
             let mut css_to_append = String::new();
             for class in new_classes {
-                let rule = format!(".{} {{\n  display: flex;\n}}\n\n", class);
+                let mut escaped_class = String::new();
+                serialize_identifier(&class, &mut escaped_class).unwrap();
+                let rule = format!(".{} {{\n  display: flex;\n}}\n\n", escaped_class);
                 css_to_append.push_str(&rule);
             }
             file.write_all(css_to_append.as_bytes())?;
@@ -156,7 +191,7 @@ fn rebuild_styles(
 
     if is_initial_run || added_count > 0 {
         let timing_details = format!(
-            "Total: {} (Regex Find & Cache: {}, CSS Append: {})",
+            "Total: {} (Parse & Cache: {}, CSS Append: {})",
             format_duration(total_duration),
             format_duration(find_and_cache_duration),
             format_duration(css_write_duration)
