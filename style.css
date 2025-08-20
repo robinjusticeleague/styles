@@ -2,7 +2,19 @@
   display: flex;
 }
 
+.green {
+  display: flex;
+}
+
 .hidden {
+  display: flex;
+}
+
+.red {
+  display: flex;
+}
+
+.test {
   display: flex;
 }
 
