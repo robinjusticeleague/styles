@@ -4,26 +4,36 @@ use html5ever::tokenizer::{
     BufferQueue, TagKind, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts,
 };
 use lightningcss::stylesheet::{ParserOptions, PrinterOptions, StyleSheet};
-use notify::{event::ModifyKind, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use memmap2::Mmap;
+use notify_debouncer_full::new_debouncer;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use seahash::SeaHasher;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashSet};
-use std::fmt::Write;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fs::{File, OpenOptions};
+use std::hash::Hasher;
+use std::io::Write as IoWrite;
 use std::path::Path;
-use std::sync::{mpsc, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use sysinfo::System;
 use tendril::{fmt::UTF8, Tendril};
 
-static HTML_CACHE: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
-static CSS_CACHE: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
-static OLD_SCSS: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
-static FORMATTED_CUSTOM_CSS: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
+// A static regex to find the custom SCSS block in the CSS file.
 static RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)/\* Dx\s*(.*?)\s*\*/").unwrap());
 
+// A struct to hold the application's state, protected by a Mutex for thread-safe access.
+struct AppState {
+    html_hash: u64,
+    css_hash: u64,
+    class_cache: BTreeSet<String>,
+    utility_css_cache: HashMap<String, String>,
+    formatted_custom_css: String,
+    old_scss: String,
+}
+
+// The ClassExtractor is a sink for the HTML5 tokenizer. It collects all class attributes.
 struct ClassExtractor {
     classes: RefCell<BTreeSet<String>>,
 }
@@ -37,6 +47,7 @@ impl TokenSink for ClassExtractor {
                 for attr in tag.attrs.iter() {
                     if &*attr.name.local == "class" {
                         let class_value = &attr.value;
+                        // Custom parsing logic to handle complex class attributes, including those with parentheses.
                         let mut current_class = String::new();
                         let mut paren_level = 0;
                         let mut classes = self.classes.borrow_mut();
@@ -79,6 +90,7 @@ impl TokenSink for ClassExtractor {
     }
 }
 
+// Prints system information like CPU cores and available memory.
 fn print_system_info() {
     let mut sys = System::new_all();
     sys.refresh_memory();
@@ -95,10 +107,12 @@ fn print_system_info() {
     );
 }
 
+// Main function: sets up files, state, and the file watcher loop.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", "Starting DX Style Engine...".cyan());
     print_system_info();
 
+    // Ensure index.html and style.css exist before we start.
     if !Path::new("style.css").exists() {
         File::create("style.css")?;
     }
@@ -106,177 +120,229 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         File::create("index.html")?;
     }
 
-    let mut class_cache: BTreeSet<String> = BTreeSet::new();
-    read_existing_classes("style.css", &mut class_cache)?;
-    rebuild_styles(&mut class_cache, true)?;
+    // Initialize the application state within an Arc<Mutex> for shared, thread-safe access.
+    let app_state = Arc::new(Mutex::new(AppState {
+        html_hash: 0,
+        css_hash: 0,
+        class_cache: BTreeSet::new(),
+        utility_css_cache: HashMap::new(),
+        formatted_custom_css: String::new(),
+        old_scss: String::new(),
+    }));
 
-    let (tx, mut rx) = mpsc::channel();
+    // Perform the initial style generation.
+    rebuild_styles(app_state.clone(), true)?;
 
-    let mut watcher = RecommendedWatcher::new(
-        move |res: Result<notify::Event, notify::Error>| {
-            if let Ok(event) = res {
-                if matches!(event.kind, EventKind::Modify(ModifyKind::Data(_))) {
-                    tx.send(()).ok();
-                }
-            }
-        },
-        notify::Config::default(),
-    )?;
+    // Set up a debounced file watcher to handle file change events efficiently.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut debouncer = new_debouncer(Duration::from_millis(50), None, tx)?;
 
-    watcher.watch(Path::new("index.html"), RecursiveMode::NonRecursive)?;
-    watcher.watch(Path::new("style.css"), RecursiveMode::NonRecursive)?;
+    debouncer
+        .watch(Path::new("index.html"), notify::RecursiveMode::NonRecursive)?;
+    debouncer
+        .watch(Path::new("style.css"), notify::RecursiveMode::NonRecursive)?;
 
     println!("{}", "Watching index.html and style.css for changes...".cyan());
-    loop {
-        if rx.recv().is_err() {
-            break;
-        }
 
-        drop(watcher);
-
-        rebuild_styles(&mut class_cache, false)?;
-
-        let (new_tx, new_rx) = mpsc::channel();
-        rx = new_rx;
-
-        let mut new_watcher = RecommendedWatcher::new(
-            move |res: Result<notify::Event, notify::Error>| {
-                if let Ok(event) = res {
-                    if matches!(event.kind, EventKind::Modify(ModifyKind::Data(_))) {
-                        new_tx.send(()).ok();
-                    }
-                }
-            },
-            notify::Config::default(),
-        )?;
-        new_watcher.watch(Path::new("index.html"), RecursiveMode::NonRecursive)?;
-        new_watcher.watch(Path::new("style.css"), RecursiveMode::NonRecursive)?;
-        watcher = new_watcher;
-    }
-
-    Ok(())
-}
-
-fn read_existing_classes(
-    css_path: &str,
-    cache: &mut BTreeSet<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let file = File::open(css_path)?;
-    let reader = BufReader::new(file);
-
-    for line in reader.lines() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.starts_with('.') {
-            if let Some(class_part) = trimmed.split('{').next() {
-                if let Some(class) = class_part.trim().strip_prefix('.') {
-                    if !class.is_empty() {
-                        cache.insert(class.to_string());
-                    }
+    // Main event loop: waits for file change events and triggers style rebuilds.
+    for res in rx {
+        match res {
+            Ok(_) => {
+                // We got a debounced event, so we can rebuild styles.
+                if let Err(e) = rebuild_styles(app_state.clone(), false) {
+                    eprintln!("{} {}", "Error rebuilding styles:".red(), e);
                 }
             }
+            Err(e) => eprintln!("{} {:?}", "Watch error:".red(), e),
         }
     }
+
     Ok(())
 }
 
+// Core function to rebuild styles when a file changes.
 fn rebuild_styles(
-    class_cache: &mut BTreeSet<String>,
+    state: Arc<Mutex<AppState>>,
     is_initial_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let total_start = Instant::now();
 
-    let html_content = fs::read_to_string("index.html")?;
-    let css_content = fs::read_to_string("style.css")?;
+    // Memory map the files to avoid blocking I/O. This is much faster than reading.
+    let html_file = File::open("index.html")?;
+    let css_file = File::open("style.css")?;
+    let html_mmap = unsafe { Mmap::map(&html_file)? };
+    let css_mmap = unsafe { Mmap::map(&css_file)? };
 
-    let mut old_html = HTML_CACHE.lock().unwrap();
-    let mut old_css = CSS_CACHE.lock().unwrap();
+    // Calculate hashes of the file contents to quickly check for changes.
+    let mut html_hasher = SeaHasher::new();
+    html_hasher.write(&html_mmap);
+    let new_html_hash = html_hasher.finish();
 
-    let html_changed = *old_html != html_content;
-    let css_changed = *old_css != css_content;
+    let mut css_hasher = SeaHasher::new();
+    css_hasher.write(&css_mmap);
+    let new_css_hash = css_hasher.finish();
 
+    let (html_changed, css_changed) = {
+        let mut state_guard = state.lock().unwrap();
+        let html_changed = state_guard.html_hash != new_html_hash;
+        let css_changed = state_guard.css_hash != new_css_hash;
+
+        // Update hashes in the state.
+        state_guard.html_hash = new_html_hash;
+        state_guard.css_hash = new_css_hash;
+        (html_changed, css_changed)
+    };
+
+    // If nothing changed and it's not the first run, we're done.
     if !is_initial_run && !html_changed && !css_changed {
         return Ok(());
     }
 
-    let mut parse_extract_duration = std::time::Duration::ZERO;
-    let new_classes = if html_changed || is_initial_run {
-        let timer = Instant::now();
-        let sink = ClassExtractor {
-            classes: RefCell::new(BTreeSet::new()),
-        };
-        let tokenizer = Tokenizer::new(sink, TokenizerOpts::default());
-        let mut buffer = BufferQueue::default();
-        let tendril = Tendril::<UTF8>::from_slice(&html_content);
-        buffer.push_back(tendril.try_reinterpret().unwrap());
-        let _ = tokenizer.feed(&mut buffer);
-        tokenizer.end();
-        let classes = tokenizer.sink.classes.into_inner();
-        parse_extract_duration = timer.elapsed();
-        classes
-    } else {
-        class_cache.clone()
-    };
+    // Convert memory-mapped bytes to string slices.
+    let html_content = std::str::from_utf8(&html_mmap)?;
+    let css_content = std::str::from_utf8(&css_mmap)?;
 
+    // Use Rayon to parallelize HTML parsing and SCSS processing.
+    let (new_classes, scss_results) = rayon::join(
+        || {
+            // Task 1: Parse HTML to extract classes.
+            let timer = Instant::now();
+            let sink = ClassExtractor {
+                classes: RefCell::new(BTreeSet::new()),
+            };
+            let tokenizer = Tokenizer::new(sink, TokenizerOpts::default());
+            let mut buffer = BufferQueue::default();
+            let tendril = Tendril::<UTF8>::from_slice(html_content);
+            buffer.push_back(tendril.try_reinterpret().unwrap());
+            let _ = tokenizer.feed(&mut buffer);
+            tokenizer.end();
+            let classes = tokenizer.sink.classes.into_inner();
+            (classes, timer.elapsed())
+        },
+        || {
+            // Task 2: Process the SCSS part of the stylesheet.
+            let timer = Instant::now();
+            let scss_code = RE
+                .captures(css_content)
+                .and_then(|cap| cap.get(1))
+                .map_or("", |m| m.as_str());
+
+            let mut state_guard = state.lock().unwrap();
+            let scss_changed = state_guard.old_scss != scss_code;
+
+            if scss_changed || is_initial_run {
+                state_guard.old_scss = scss_code.to_string();
+                let compiled_scss = if !scss_code.trim().is_empty() {
+                    grass::from_string(scss_code.to_string(), &grass::Options::default())
+                        .unwrap_or_else(|e| {
+                            eprintln!("{} {}", "SCSS Error:".red(), e);
+                            String::new()
+                        })
+                } else {
+                    String::new()
+                };
+
+                let stylesheet = StyleSheet::parse(&compiled_scss, ParserOptions::default())
+                    .map_err(|e| e.to_string());
+
+                if let Ok(ss) = stylesheet {
+                    let formatted_custom = ss
+                        .to_css(PrinterOptions {
+                            minify: false,
+                            ..PrinterOptions::default()
+                        })
+                        .map(|out| out.code)
+                        .unwrap_or_default();
+                    state_guard.formatted_custom_css = formatted_custom;
+                }
+            }
+            timer.elapsed()
+        },
+    );
+
+    let (all_classes, parse_extract_duration) = new_classes;
+    let scss_duration = scss_results;
+
+    // Calculate the difference between old and new classes for incremental updates.
     let timer = Instant::now();
-    let cached_classes = class_cache.clone();
-    let added: HashSet<_> = new_classes.difference(&cached_classes).cloned().collect();
-    let removed: HashSet<_> = cached_classes.difference(&new_classes).cloned().collect();
+    let mut state_guard = state.lock().unwrap();
+    let added: HashSet<_> = all_classes.difference(&state_guard.class_cache).cloned().collect();
+    let removed: HashSet<_> = state_guard.class_cache.difference(&all_classes).cloned().collect();
     let diff_duration = timer.elapsed();
 
     let mut cache_update_duration = std::time::Duration::ZERO;
-
     if !added.is_empty() || !removed.is_empty() {
         let timer = Instant::now();
-        *class_cache = new_classes;
+        // Update the main class cache.
+        state_guard.class_cache = all_classes;
+
+        // Incrementally update the utility CSS cache.
+        for class in removed.iter() {
+            state_guard.utility_css_cache.remove(class);
+        }
+        for class in added.iter() {
+            let mut escaped_class = String::new();
+            serialize_identifier(class.as_str(), &mut escaped_class).unwrap();
+            let rule = format!(".{} {{\n  display: flex;\n}}\n", escaped_class);
+            state_guard.utility_css_cache.insert(class.clone(), rule);
+        }
         cache_update_duration = timer.elapsed();
     }
 
-    let scss_code = if let Some(captures) = RE.captures(&css_content) {
-        captures.get(1).unwrap().as_str().to_string()
-    } else {
-        String::new()
-    };
-
-    let old_scss_guard = OLD_SCSS.lock().unwrap();
-    let scss_changed = *old_scss_guard != scss_code;
-    drop(old_scss_guard);
-
-    let full_regen = scss_changed || css_changed;
-    let should_update_css = full_regen || !added.is_empty() || !removed.is_empty();
-    let mut current_css = css_content.clone();
-    let mut write_duration = std::time::Duration::ZERO;
-    if should_update_css {
-        let timer = Instant::now();
-        current_css = update_css_file(class_cache, &scss_code, full_regen, &css_content)?;
-        write_duration = timer.elapsed();
+    // Reconstruct the final CSS and write it to the file.
+    let timer = Instant::now();
+    let mut final_css = String::new();
+    if !state_guard.formatted_custom_css.is_empty() {
+        final_css.push_str(&state_guard.formatted_custom_css);
+        if !final_css.ends_with('\n') {
+            final_css.push('\n');
+        }
     }
+    // Append utility classes in a consistent order.
+    let mut sorted_classes: Vec<_> = state_guard.utility_css_cache.keys().collect();
+    sorted_classes.sort();
+    for class_name in sorted_classes {
+        if let Some(rule) = state_guard.utility_css_cache.get(class_name) {
+            final_css.push_str(rule);
+        }
+    }
+
+    let scss_block = format!("\n/* Dx\n{}\n*/", state_guard.old_scss);
+    final_css.push_str(&scss_block);
+
+    // Drop the lock before writing to the file to avoid holding it during I/O.
+    drop(state_guard);
+
+    // Only write to the file if the content has actually changed.
+    if css_content.trim() != final_css.trim() {
+        let mut file = OpenOptions::new().write(true).truncate(true).open("style.css")?;
+        file.write_all(final_css.as_bytes())?;
+    }
+    let write_duration = timer.elapsed();
 
     let total_duration = total_start.elapsed();
 
-    if should_update_css {
-        let timing_details = format!(
-            "Total: {} (Parse/Extract: {}, Diff: {}, Cache: {}, Write: {})",
-            format_duration(total_duration),
-            format_duration(parse_extract_duration),
-            format_duration(diff_duration),
-            format_duration(cache_update_duration),
-            format_duration(write_duration)
-        );
-        println!(
-            "Processed: {} added, {} removed | {}",
-            format!("{}", added.len()).green(),
-            format!("{}", removed.len()).red(),
-            timing_details.bright_black()
-        );
-    }
-
-    *old_html = html_content;
-    *old_css = current_css;
+    // Log detailed performance metrics for the update.
+    let timing_details = format!(
+        "Total: {} (HTML Parse: {}, SCSS: {}, Diff: {}, Cache: {}, Write: {})",
+        format_duration(total_duration),
+        format_duration(parse_extract_duration),
+        format_duration(scss_duration),
+        format_duration(diff_duration),
+        format_duration(cache_update_duration),
+        format_duration(write_duration)
+    );
+    println!(
+        "Processed: {} added, {} removed | {}",
+        format!("{}", added.len()).green(),
+        format!("{}", removed.len()).red(),
+        timing_details.bright_black()
+    );
 
     Ok(())
 }
 
+// Helper function to format a Duration into a human-readable string (ms or µs).
 fn format_duration(duration: std::time::Duration) -> String {
     let micros = duration.as_micros();
     if micros > 999 {
@@ -284,88 +350,4 @@ fn format_duration(duration: std::time::Duration) -> String {
     } else {
         format!("{}µs", micros)
     }
-}
-
-fn update_css_file(
-    classes: &BTreeSet<String>,
-    scss_code: &str,
-    full_regen: bool,
-    css_content: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let final_css_content = if full_regen {
-        let compiled_scss = if !scss_code.trim().is_empty() {
-            grass::from_string(scss_code.to_string(), &grass::Options::default())?
-        } else {
-            String::new()
-        };
-
-        let stylesheet = StyleSheet::parse(&compiled_scss, ParserOptions::default())
-            .map_err(|e| e.to_string())?;
-
-        let printer_options = PrinterOptions {
-            minify: false,
-            ..PrinterOptions::default()
-        };
-        let formatted_custom = stylesheet.to_css(printer_options)?.code;
-
-        let mut formatted_custom_guard = FORMATTED_CUSTOM_CSS.lock().unwrap();
-        *formatted_custom_guard = formatted_custom.clone();
-        drop(formatted_custom_guard);
-
-        let mut old_scss_guard = OLD_SCSS.lock().unwrap();
-        *old_scss_guard = scss_code.to_string();
-        drop(old_scss_guard);
-
-        let mut utility_css = String::with_capacity(classes.len() * 60);
-        for class in classes {
-            let mut escaped_class = String::new();
-            serialize_identifier(class.as_str(), &mut escaped_class).unwrap();
-            utility_css.write_fmt(format_args!(".{} {{\n  display: flex;\n}}\n\n", escaped_class))?;
-        }
-
-        let mut generated = String::new();
-        if !formatted_custom.is_empty() {
-            generated.push_str(&formatted_custom);
-            if !generated.ends_with('\n') {
-                generated.push('\n');
-            }
-        }
-        generated.push_str(&utility_css);
-
-        format!(
-            "{}\n\n/* Dx\n{}\n*/\n",
-            generated.trim(),
-            scss_code
-        )
-    } else {
-        let formatted_custom = FORMATTED_CUSTOM_CSS.lock().unwrap().clone();
-
-        let mut utility_css = String::with_capacity(classes.len() * 60);
-        for class in classes {
-            let mut escaped_class = String::new();
-            serialize_identifier(class.as_str(), &mut escaped_class).unwrap();
-            utility_css.write_fmt(format_args!(".{} {{\n  display: flex;\n}}\n\n", escaped_class))?;
-        }
-
-        let mut generated = String::new();
-        if !formatted_custom.is_empty() {
-            generated.push_str(&formatted_custom);
-            if !generated.ends_with('\n') {
-                generated.push('\n');
-            }
-        }
-        generated.push_str(&utility_css);
-
-        format!(
-            "{}\n\n/* Dx\n{}\n*/\n",
-            generated.trim(),
-            scss_code
-        )
-    };
-
-    if final_css_content != css_content {
-        fs::write("style.css", &final_css_content)?;
-    }
-
-    Ok(final_css_content)
 }
