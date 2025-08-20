@@ -2,6 +2,10 @@
   display: flex;
 }
 
+.green {
+  display: flex;
+}
+
 .grid {
   display: flex;
 }
@@ -11,6 +15,10 @@
 }
 
 .op {
+  display: flex;
+}
+
+.red {
   display: flex;
 }
 
