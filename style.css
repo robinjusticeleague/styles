@@ -1,11 +1,10 @@
-
 .\+card\(flex\ text-md\ p-4\) {
   display: flex;
 }
 .border-4 {
   display: flex;
 }
-.grid {
+.hidden {
   display: flex;
 }
 .m-54 {
@@ -14,7 +13,3 @@
 .text-10xl {
   display: flex;
 }
-
-/* Dx
-
-*/
