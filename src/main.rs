@@ -1,324 +1,182 @@
-use ahash::{AHashMap, AHashSet, AHasher};
-use colored::Colorize;
-use cssparser::serialize_identifier;
-use memchr::{memchr, memmem::Finder};
-use memmap2::MmapOptions;
-use notify_debouncer_full::new_debouncer;
+use ahash::{AHashMap, AHashSet};
+use memmap2::MmapMut;
 use rayon::prelude::*;
-use std::fs::{self, File};
-use std::hash::Hasher;
-use std::io::{BufWriter, Write as IoWrite};
+use std::fs::OpenOptions;
+use std::io::{self, Write, BufWriter};
 use std::path::Path;
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, Instant};
-use sysinfo::System;
+use std::sync::LazyLock;
 
-struct AppState {
-    html_hash: u64,
-    class_cache: AHashSet<String>,
-    utility_css_cache: AHashMap<String, String>,
-    css_hash: u64,
-    css_buffer: Vec<u8>,
+// Precompute tables lazily at runtime
+static WS: LazyLock<[bool; 256]> = LazyLock::new(make_ws_table);
+static QT: LazyLock<[bool; 256]> = LazyLock::new(make_quote_table);
+
+#[inline(always)]
+fn make_ws_table() -> [bool; 256] {
+    let mut ws = [false; 256];
+    ws[b' ' as usize] = true;
+    ws[b'\n' as usize] = true;
+    ws[b'\r' as usize] = true;
+    ws[b'\t' as usize] = true;
+    ws
 }
 
-fn print_system_info() {
-    let mut sys = System::new_all();
-    sys.refresh_memory();
-    let total_memory = sys.total_memory() / 1024 / 1024;
-    let available_memory = sys.available_memory() / 1024 / 1024;
-    let core_count = sys.cpus().len();
-    println!(
-        "{}",
-        format!(
-            "System Info: {} Cores, {}MB/{}MB Available Memory",
-            core_count, available_memory, total_memory
-        )
-        .dimmed()
-    );
+#[inline(always)]
+fn make_quote_table() -> [bool; 256] {
+    let mut qt = [false; 256];
+    qt[b'"' as usize] = true;
+    qt[b'\'' as usize] = true;
+    qt
 }
 
-fn write_css_optimized(path: &str, data: &[u8]) -> std::io::Result<()> {
-    const MMAP_THRESHOLD: usize = 2 * 1024 * 1024;
-    if data.len() < MMAP_THRESHOLD {
-        let file = File::create(path)?;
-        let mut buf = BufWriter::with_capacity(64 * 1024, file);
-        buf.write_all(data)?;
-        buf.flush()?;
-    } else {
-        let file = File::options().read(true).write(true).create(true).open(path)?;
-        file.set_len(data.len() as u64)?;
-        let mut mmap = unsafe { MmapOptions::new().map_mut(&file)? };
-        mmap[..data.len()].copy_from_slice(data);
-    }
-    Ok(())
+#[inline(always)]
+fn is_ws(b: u8) -> bool { WS[b as usize] }
+
+#[inline(always)]
+fn is_quote(b: u8) -> bool { QT[b as usize] }
+
+#[inline(always)]
+fn eq5(bytes: &[u8], i: usize, pat: &[u8; 5]) -> bool {
+    let j = i + 5;
+    j <= bytes.len() && &bytes[i..j] == pat
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", "Starting DX Style Engine...".cyan());
-    print_system_info();
-
-    if !Path::new("style.css").exists() {
-        File::create("style.css")?;
+#[inline(always)]
+fn binary_insert_sorted<'a>(v: &mut Vec<&'a str>, item: &'a str) {
+    match v.binary_search(&item) {
+        Ok(_) => {}
+        Err(pos) => v.insert(pos, item),
     }
-    if !Path::new("index.html").exists() {
-        File::create("index.html")?;
-    }
-
-    let app_state = Arc::new(Mutex::new(AppState {
-        html_hash: 0,
-        class_cache: AHashSet::default(),
-        utility_css_cache: AHashMap::default(),
-        css_hash: 0,
-        css_buffer: Vec::with_capacity(1024),
-    }));
-
-    rebuild_styles(app_state.clone(), true)?;
-
-    let (tx, rx) = mpsc::channel();
-    let mut debouncer = new_debouncer(Duration::from_millis(1), None, tx)?;
-    debouncer.watch(Path::new("index.html"), notify::RecursiveMode::NonRecursive)?;
-    println!("{}", "Watching index.html for changes...".cyan());
-
-    for res in rx {
-        match res {
-            Ok(_) => {
-                if let Err(e) = rebuild_styles(app_state.clone(), false) {
-                    eprintln!("{} {}", "Error rebuilding styles:".red(), e);
-                }
-            }
-            Err(e) => eprintln!("{} {:?}", "Watch error:".red(), e),
-        }
-    }
-
-    Ok(())
 }
 
-fn extract_classes_fast(html_bytes: &[u8], capacity_hint: usize) -> AHashSet<String> {
-    let mut set = AHashSet::with_capacity(capacity_hint.max(64));
-    let finder = Finder::new(b"class");
-    let mut pos = 0usize;
-    let n = html_bytes.len();
+pub fn collect_classes<'a>(html: &'a [u8]) -> Vec<&'a str> {
+    let mut seen: AHashSet<&'a str> = AHashSet::with_capacity((html.len() / 96).max(32));
+    let mut out: Vec<&'a str> = Vec::with_capacity((html.len() / 96).max(32));
 
-    while let Some(idx) = finder.find(&html_bytes[pos..]) {
-        let start = pos + idx + 5;
-        let mut i = start;
-        while i < n && matches!(html_bytes[i], b' ' | b'\n' | b'\r' | b'\t') {
+    let mut i = 0usize;
+    let n = html.len();
+    const CLASS: &[u8; 5] = b"class";
+
+    while i + 5 <= n {
+        if html[i] != b'c' || !eq5(html, i, CLASS) {
             i += 1;
-        }
-        if i >= n || html_bytes[i] != b'=' {
-            pos = start;
+            while i < n && html[i] != b'c' { i += 1; }
             continue;
         }
+        i += 5;
+
+        while i < n && is_ws(html[i]) { i += 1; }
+        if i >= n || html[i] != b'=' { continue; }
         i += 1;
-        while i < n && matches!(html_bytes[i], b' ' | b'\n' | b'\r' | b'\t') {
-            i += 1;
-        }
-        if i >= n {
-            break;
-        }
-        let quote = html_bytes[i];
-        if quote != b'"' && quote != b'\'' {
-            pos = i;
-            continue;
-        }
+
+        while i < n && is_ws(html[i]) { i += 1; }
+        if i >= n || !is_quote(html[i]) { continue; }
+        let quote = html[i];
         i += 1;
-        let value_start = i;
-        let rel_end = memchr(quote, &html_bytes[value_start..]);
-        let value_end = match rel_end {
-            Some(off) => value_start + off,
-            None => break,
-        };
-        if let Ok(value_str) = std::str::from_utf8(&html_bytes[value_start..value_end]) {
-            for cls in value_str.split_whitespace() {
-                if !cls.is_empty() {
-                    set.insert(cls.to_string());
+
+        while i < n && html[i] != quote {
+            while i < n && html[i] != quote && is_ws(html[i]) { i += 1; }
+            if i >= n || html[i] == quote { break; }
+            let start = i;
+            while i < n && html[i] != quote && !is_ws(html[i]) { i += 1; }
+            let end = i;
+            if end > start {
+                let cls = unsafe { std::str::from_utf8_unchecked(&html[start..end]) };
+                if seen.insert(cls) {
+                    binary_insert_sorted(&mut out, cls);
                 }
             }
         }
-        pos = value_end + 1;
+        if i < n && html[i] == quote { i += 1; }
     }
 
-    set
+    out
 }
 
-fn rebuild_styles(
-    state: Arc<Mutex<AppState>>,
-    is_initial_run: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let total_start = Instant::now();
+pub fn build_css_parallel(keys: &[&str], cache: &AHashMap<String, String>) -> Vec<u8> {
+    const CHUNK: usize = 256;
 
-    let html_bytes = fs::read("index.html")?;
+    let lengths: Vec<usize> = keys.par_iter()
+        .map(|k| cache.get(*k).map(|s| s.len()).unwrap_or(0))
+        .collect();
+    let total_len: usize = lengths.iter().sum::<usize>()
+        + (if keys.is_empty() { 0 } else { (keys.len() - 1) * 2 });
 
-    let new_html_hash = {
-        let mut hasher = AHasher::default();
-        hasher.write(&html_bytes);
-        hasher.finish()
-    };
-
-    {
-        let state_guard = state.lock().unwrap();
-        if !is_initial_run && state_guard.html_hash == new_html_hash {
-            return Ok(());
-        }
-    }
-
-    let parse_timer = Instant::now();
-    let prev_len_hint = { state.lock().unwrap().class_cache.len() };
-    let all_classes = extract_classes_fast(&html_bytes, prev_len_hint.next_power_of_two());
-    let parse_extract_duration = parse_timer.elapsed();
-
-    let diff_timer = Instant::now();
-    let (added, removed, old_hash_just_for_info) = {
-        let state_guard = state.lock().unwrap();
-
-        if !is_initial_run && state_guard.html_hash == new_html_hash {
-            return Ok(());
-        }
-
-        let old = &state_guard.class_cache;
-        let added: Vec<String> = all_classes.difference(old).cloned().collect();
-        let removed: Vec<String> = old.difference(&all_classes).cloned().collect();
-
-        (added, removed, state_guard.html_hash)
-    };
-    let diff_duration = diff_timer.elapsed();
-
-    if added.is_empty() && removed.is_empty() {
-        let mut state_guard = state.lock().unwrap();
-        state_guard.html_hash = new_html_hash;
-
-        let wall_time = total_start.elapsed();
-        let processing_time = parse_extract_duration + diff_duration;
-        println!(
-            "Processed: {} added, {} removed | Wall: {} (Processing: {} [Parse: {}, Diff: {}])",
-            format!("{}", 0).green(),
-            format!("{}", 0).red(),
-            format_duration(wall_time),
-            format_duration(processing_time),
-            format_duration(parse_extract_duration),
-            format_duration(diff_duration),
-        );
-        return Ok(());
-    }
-
-    const PAR_THRESHOLD: usize = 512;
-    let cache_update_timer = Instant::now();
-    let new_rules: Vec<(String, String)> = if added.len() >= PAR_THRESHOLD {
-        added
-            .par_iter()
-            .map(|class| {
-                let mut escaped = String::with_capacity(class.len());
-                serialize_identifier(class, &mut escaped).unwrap();
-                let rule = format!(".{} {{\n  display: flex;\n}}", escaped);
-                (class.clone(), rule)
-            })
-            .collect()
-    } else {
-        let mut escaped = String::with_capacity(128);
-        added
-            .iter()
-            .map(|class| {
-                escaped.clear();
-                serialize_identifier(class, &mut escaped).unwrap();
-                let rule = format!(".{} {{\n  display: flex;\n}}", &escaped);
-                (class.clone(), rule)
-            })
-            .collect()
-    };
-    let cache_update_duration = cache_update_timer.elapsed();
-
-    let css_write_timer = Instant::now();
-    let (css_bytes, css_changed) = {
-        let mut state_guard = state.lock().unwrap();
-
-        state_guard.html_hash = new_html_hash;
-        state_guard.class_cache = all_classes;
-
-        for class in removed.iter() {
-            state_guard.utility_css_cache.remove(class);
-        }
-        if !new_rules.is_empty() {
-            state_guard.utility_css_cache.extend(new_rules);
-        }
-
-        let mut keys: Vec<String> = state_guard
-            .utility_css_cache
-            .keys()
-            .cloned()
-            .collect();
-
-        if keys.len() >= PAR_THRESHOLD {
-            keys.par_sort_unstable();
-        } else {
-            keys.sort_unstable();
-        }
-
-        let total_len_est: usize = state_guard
-            .utility_css_cache
-            .values()
-            .map(|s| s.len() + 2)
-            .sum();
-
-        let rules_bytes: Vec<Vec<u8>> = keys
-            .into_iter()
-            .map(|k| state_guard.utility_css_cache.get(&k).unwrap().as_bytes().to_vec())
-            .collect();
-
-        state_guard.css_buffer.clear();
-        state_guard.css_buffer.reserve(total_len_est.max(64));
-
-        for (i, rule) in rules_bytes.iter().enumerate() {
-            if i > 0 {
-                state_guard.css_buffer.extend_from_slice(b"\n\n");
+    let parts: Vec<Vec<u8>> = keys.par_chunks(CHUNK)
+        .map(|chunk| {
+            let mut buf = Vec::with_capacity(
+                chunk.iter()
+                     .map(|k| cache.get(*k).map(|s| s.len()).unwrap_or(0))
+                     .sum::<usize>()
+                + (if chunk.is_empty() { 0 } else { (chunk.len() - 1) * 2 })
+            );
+            let mut first = true;
+            for k in chunk {
+                if let Some(body) = cache.get(*k) {
+                    if !first { buf.extend_from_slice(b"\n\n"); }
+                    first = false;
+                    buf.extend_from_slice(body.as_bytes());
+                }
             }
-            state_guard.css_buffer.extend_from_slice(rule);
-        }
-        if !state_guard.utility_css_cache.is_empty() {
-            state_guard.css_buffer.extend_from_slice(b"\n");
-        }
+            buf
+        })
+        .collect();
 
-        let mut hasher = AHasher::default();
-        hasher.write(&state_guard.css_buffer);
-        let new_css_hash = hasher.finish();
-        let css_changed_flag = if !is_initial_run && new_css_hash == state_guard.css_hash {
-            false
-        } else {
-            state_guard.css_hash = new_css_hash;
-            true
-        };
-
-        (state_guard.css_buffer.clone(), css_changed_flag)
-    };
-    if css_changed {
-        write_css_optimized("style.css", &css_bytes)?;
+    let mut out = Vec::with_capacity(total_len);
+    let mut first = true;
+    for mut part in parts {
+        if part.is_empty() { continue; }
+        if !first { out.extend_from_slice(b"\n\n"); }
+        first = false;
+        out.append(&mut part);
     }
-    let css_write_duration = css_write_timer.elapsed();
+    out
+}
 
-    let wall_time = total_start.elapsed();
-    let processing_time =
-        parse_extract_duration + diff_duration + cache_update_duration + css_write_duration;
-
-    println!(
-        "Processed: {} added, {} removed (prev hash: {:x}) | Wall: {} (Processing: {} [Parse: {}, Diff: {}, Cache: {}, CSS Write: {}])",
-        format!("{}", added.len()).green(),
-        format!("{}", removed.len()).red(),
-        old_hash_just_for_info,
-        format_duration(wall_time),
-        format_duration(processing_time),
-        format_duration(parse_extract_duration),
-        format_duration(diff_duration),
-        format_duration(cache_update_duration),
-        format_duration(css_write_duration)
-    );
-
+#[inline(always)]
+fn write_bufwriter(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let file = OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
+    let mut w = BufWriter::with_capacity(128 * 1024, file);
+    w.write_all(bytes)?;
+    w.flush()?;
     Ok(())
 }
 
-fn format_duration(duration: std::time::Duration) -> String {
-    let micros = duration.as_micros();
-    if micros > 999 {
-        format!("{:.2}ms", micros as f64 / 1000.0)
+#[inline(always)]
+fn write_mmap(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let len = bytes.len() as u64;
+    let file = OpenOptions::new().read(true).write(true).create(true).open(path)?;
+    file.set_len(len)?;
+    let mut mmap: MmapMut = unsafe { MmapMut::map_mut(&file)? };
+    mmap[..bytes.len()].copy_from_slice(bytes);
+    mmap.flush()?;
+    Ok(())
+}
+
+pub fn write_css_fast(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    const MMAP_CUTOFF: usize = 256 * 1024;
+    if bytes.len() >= MMAP_CUTOFF {
+        write_mmap(path, bytes)
     } else {
-        format!("{}µs", micros)
+        write_bufwriter(path, bytes)
     }
+}
+
+pub fn process_html_and_write(
+    html: &[u8],
+    cache: &AHashMap<String, String>,
+    out_path: &Path,
+) -> io::Result<()> {
+    let keys = collect_classes(html);
+    let css = build_css_parallel(&keys, cache);
+    write_css_fast(out_path, &css)
+}
+
+// Minimal main so `cargo run` works
+fn main() -> io::Result<()> {
+    let html = br#"<div class='a b c'></div>"#;
+    let mut cache = AHashMap::new();
+    cache.insert("a".into(), ".a{color:red;}".into());
+    cache.insert("b".into(), ".b{margin:0;}".into());
+    cache.insert("c".into(), ".c{padding:4px;}".into());
+    process_html_and_write(html, &cache, Path::new("out.css"))
 }
