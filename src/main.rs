@@ -215,7 +215,7 @@ fn rebuild_styles(
         for class_name in sorted_classes {
             if let Some(rule) = state_guard.utility_css_cache.get(&class_name) {
                 if !first {
-                    writer.write_all(b"\n\n")?;
+                    writer.write_all(b"\n")?;
                 }
                 writer.write_all(rule.as_bytes())?;
                 first = false;
