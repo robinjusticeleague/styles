@@ -1,109 +1,189 @@
-use gix::Repository;
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::channel;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::fs;
-use std::env;
-// Add this to your Cargo.toml file: diff = "0.1.13"
-use diff;
+use colored::Colorize;
+use cssparser::serialize_identifier;
+use memmap2::Mmap;
+use notify_debouncer_full::new_debouncer;
+use once_cell::sync::Lazy;
+use rayon::prelude::*;
+use regex::Regex;
+use seahash::SeaHasher;
+use std::collections::HashSet;
+use std::fs::{self, File};
+use std::hash::Hasher;
+use std::io::{BufWriter, Write};
+use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+use sysinfo::System;
 
-fn get_timestamp() -> String {
-    let now = SystemTime::now();
-    let since_epoch = now.duration_since(UNIX_EPOCH).expect("Time went backwards");
-    let secs = since_epoch.as_secs();
-    let micros = since_epoch.subsec_micros();
-    format!("{}.{:06}", secs, micros)
+static CLASS_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"class="([^"]*)""#).unwrap());
+static LAST_HTML_HASH: Mutex<u64> = Mutex::new(0);
+
+fn print_system_info() {
+    let mut sys = System::new_all();
+    sys.refresh_memory();
+    let total_memory = sys.total_memory() / 1024 / 1024;
+    let available_memory = sys.available_memory() / 1024 / 1024;
+    let core_count = sys.cpus().len();
+    println!(
+        "{}",
+        format!(
+            "System Info: {} Cores, {}MB/{}MB Available Memory",
+            core_count, available_memory, total_memory
+        )
+        .dimmed()
+    );
 }
 
-fn log_changed_lines(repo: &Repository, path: &Path, workdir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let start_time = SystemTime::now();
-    
-    let rel_path = path.strip_prefix(workdir)?;
-    
-    let current_content = fs::read_to_string(path).unwrap_or_default();
-    
-    let head_commit = repo.head_commit()?;
-    let tree = head_commit.tree()?;
-    
-    let head_content = match tree.lookup_entry_by_path(rel_path) {
-        Ok(Some(entry)) => {
-            let blob = entry.object()?.into_blob();
-            String::from_utf8_lossy(&blob.data).to_string()
-        },
-        _ => String::new(),
-    };
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", "Starting DX Style Engine...".cyan());
+    print_system_info();
 
-    if current_content == head_content {
-        return Ok(());
+    if !Path::new("style.css").exists() {
+        fs::write("style.css", "")?;
+    }
+    if !Path::new("index.html").exists() {
+        fs::write("index.html", "")?;
     }
 
-    println!("\n[{}] Change detected in {:?}", get_timestamp(), rel_path);
-    
-    let mut changes_found = false;
-    for diff in diff::lines(&head_content, &current_content) {
-        changes_found = true;
-        match diff {
-            diff::Result::Left(l)    => println!("- {}", l),
-            diff::Result::Right(r)   => println!("+ {}", r),
-            diff::Result::Both(_, _) => (),
-        }
-    }
+    rebuild_styles(true)?;
 
-    if changes_found {
-        let duration = start_time.elapsed()?;
-        let millis = duration.as_millis();
-        if millis > 0 {
-            println!("Time to log change: {} ms", millis);
-        } else {
-            let micros = duration.as_micros();
-            println!("Time to log change: {} qs", micros);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut debouncer = new_debouncer(Duration::from_millis(50), None, tx)?;
+
+    debouncer.watch(Path::new("index.html"), notify::RecursiveMode::NonRecursive)?;
+
+    println!("{}", "Watching index.html for changes...".cyan());
+
+    for res in rx {
+        match res {
+            Ok(_) => {
+                if let Err(e) = rebuild_styles(false) {
+                    eprintln!("{} {}", "Error rebuilding styles:".red(), e);
+                }
+            }
+            Err(e) => eprintln!("{} {:?}", "Watch error:".red(), e),
         }
     }
 
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let workdir = env::current_dir()?.canonicalize()?;
-    let repo = gix::open(&workdir)?;
+fn rebuild_styles(is_initial_run: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let html_file = File::open("index.html")?;
+    let html_mmap = unsafe { Mmap::map(&html_file)? };
 
-    let (tx, rx) = channel();
-    let mut watcher = RecommendedWatcher::new(
-        move |res: notify::Result<Event>| {
-            if let Ok(event) = res {
-                tx.send(event).unwrap();
-            }
-        },
-        Config::default().with_poll_interval(Duration::from_millis(200)),
-    )?;
+    let new_html_hash = {
+        let mut hasher = SeaHasher::new();
+        hasher.write(&html_mmap);
+        hasher.finish()
+    };
 
-    let watch_path = workdir.join("test");
-    if !watch_path.exists() {
-        eprintln!("Error: The 'test' directory does not exist in '{}'. Please create it.", workdir.display());
+    let html_changed = {
+        let mut last_hash = LAST_HTML_HASH.lock().unwrap();
+        if *last_hash != new_html_hash {
+            *last_hash = new_html_hash;
+            true
+        } else {
+            false
+        }
+    };
+
+    if !is_initial_run && !html_changed {
         return Ok(());
     }
-    watcher.watch(&watch_path, RecursiveMode::Recursive)?;
 
-    println!("Monitoring '{}' for changes. Press Ctrl+C to stop.", watch_path.display());
+    let total_start = Instant::now();
 
-    loop {
-        match rx.recv() {
-            Ok(event) => {
-                match event.kind {
-                    EventKind::Create(_) | EventKind::Modify(_) => {
-                        for path in event.paths {
-                            if path.is_file() {
-                                if let Err(e) = log_changed_lines(&repo, &path, &workdir) {
-                                    eprintln!("Error processing file '{}': {}", path.display(), e);
-                                }
+    let html_content = std::str::from_utf8(&html_mmap)?;
+    let timer = Instant::now();
+
+    let captures: Vec<_> = CLASS_RE.captures_iter(html_content).collect();
+
+    let all_html_classes: HashSet<String> = captures
+        .par_iter()
+        .fold(
+            || HashSet::with_capacity(256),
+            |mut acc, cap| {
+                let group = cap.get(1).unwrap();
+                let class_str = group.as_str();
+                let mut start = 0;
+                let mut paren_level = 0;
+
+                for (i, c) in class_str.char_indices() {
+                    match c {
+                        '(' => paren_level += 1,
+                        ')' => {
+                            if paren_level > 0 {
+                                paren_level -= 1;
                             }
                         }
-                    },
-                    _ => {}
+                        ' ' | '\t' | '\n' | '\r' if paren_level == 0 => {
+                            if i > start {
+                                acc.insert(class_str[start..i].to_string());
+                            }
+                            start = i + c.len_utf8();
+                        }
+                        _ => {}
+                    }
                 }
-            }
-            Err(e) => eprintln!("Channel error: {:?}", e),
-        }
+                if start < class_str.len() {
+                    acc.insert(class_str[start..].to_string());
+                }
+                acc
+            },
+        )
+        .reduce(
+            || HashSet::with_capacity(1024),
+            |mut a, b| {
+                a.extend(b);
+                a
+            },
+        );
+
+    let parse_duration = timer.elapsed();
+    let write_timer = Instant::now();
+
+    let mut sorted_classes: Vec<_> = all_html_classes.into_iter().collect();
+    sorted_classes.sort_unstable();
+
+    let file = File::create("style.css")?;
+    let mut writer = BufWriter::with_capacity(sorted_classes.len() * 50, file);
+
+    for class in &sorted_classes {
+        let mut escaped_class = String::new();
+        serialize_identifier(class, &mut escaped_class).unwrap();
+        write!(
+            writer,
+            ".{} {{\n  display: flex;\n}}\n\n",
+            escaped_class
+        )?;
+    }
+    writer.flush()?;
+    let write_duration = write_timer.elapsed();
+
+    let total_duration = total_start.elapsed();
+    let class_count = sorted_classes.len();
+
+    let timing_details = format!(
+        "Total: {} (Parse: {}, Write: {})",
+        format_duration(total_duration),
+        format_duration(parse_duration),
+        format_duration(write_duration)
+    );
+    println!(
+        "Generated: {} classes | {}",
+        format!("{}", class_count).green(),
+        timing_details.bright_black()
+    );
+
+    Ok(())
+}
+
+fn format_duration(duration: std::time::Duration) -> String {
+    let micros = duration.as_micros();
+    if micros > 999 {
+        format!("{:.2}ms", micros as f64 / 1000.0)
+    } else {
+        format!("{}µs", micros)
     }
 }
