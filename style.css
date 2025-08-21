@@ -1,4 +1,8 @@
-.bg-pink-500 {
+.bg-red-500 {
+  display: flex;
+}
+
+.flex {
   display: flex;
 }
 
