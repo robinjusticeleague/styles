@@ -2,9 +2,9 @@ use ahash::{AHashMap, AHashSet, AHasher};
 use colored::Colorize;
 use cssparser::serialize_identifier;
 use memchr::{memchr, memmem::Finder};
-use memmap2::Mmap;
 use notify_debouncer_full::new_debouncer;
 use rayon::prelude::*;
+use std::fs;
 use std::fs::File;
 use std::hash::Hasher;
 use std::io::Write as IoWrite;
@@ -144,12 +144,11 @@ fn rebuild_styles(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let total_start = Instant::now();
 
-    let html_file = File::open("index.html")?;
-    let html_mmap = unsafe { Mmap::map(&html_file)? };
+    let html_bytes = fs::read("index.html")?;
 
     let new_html_hash = {
         let mut hasher = AHasher::default();
-        hasher.write(&html_mmap);
+        hasher.write(&html_bytes);
         hasher.finish()
     };
 
@@ -162,7 +161,7 @@ fn rebuild_styles(
 
     let parse_timer = Instant::now();
     let prev_len_hint = { state.lock().unwrap().class_cache.len() };
-    let all_classes = extract_classes_fast(&html_mmap, prev_len_hint.next_power_of_two());
+    let all_classes = extract_classes_fast(&html_bytes, prev_len_hint.next_power_of_two());
     let parse_extract_duration = parse_timer.elapsed();
 
     let diff_timer = Instant::now();
@@ -229,7 +228,7 @@ fn rebuild_styles(
     let cache_update_duration = cache_update_timer.elapsed();
 
     let css_write_timer = Instant::now();
-    let (css_content, css_changed) = {
+    let (css_bytes, css_changed) = {
         let mut state_guard = state.lock().unwrap();
 
         state_guard.html_hash = new_html_hash;
@@ -254,22 +253,24 @@ fn rebuild_styles(
             .values()
             .map(|s| s.len() + 2)
             .sum();
-        let mut css_content = String::with_capacity(total_len_est.max(64));
+        
+        // OPTIMIZATION: Build a byte vector directly to avoid String overhead.
+        let mut css_bytes = Vec::with_capacity(total_len_est.max(64));
 
         for (i, k) in keys.iter().enumerate() {
             if i > 0 {
-                css_content.push_str("\n\n");
+                css_bytes.write_all(b"\n\n").unwrap();
             }
             if let Some(rule) = state_guard.utility_css_cache.get(*k) {
-                css_content.push_str(rule);
+                css_bytes.write_all(rule.as_bytes()).unwrap();
             }
         }
         if !state_guard.utility_css_cache.is_empty() {
-            css_content.push('\n');
+            css_bytes.write_all(b"\n").unwrap();
         }
 
         let mut hasher = AHasher::default();
-        hasher.write(css_content.as_bytes());
+        hasher.write(&css_bytes);
         let new_css_hash = hasher.finish();
         let css_changed_flag = if !is_initial_run && new_css_hash == state_guard.css_hash {
             false
@@ -277,12 +278,12 @@ fn rebuild_styles(
             state_guard.css_hash = new_css_hash;
             true
         };
-        (css_content, css_changed_flag)
+        (css_bytes, css_changed_flag)
     };
 
     if css_changed {
-        let mut file = File::create("style.css")?;
-        file.write_all(css_content.as_bytes())?;
+        // OPTIMIZATION: Use fs::write for a more efficient single write operation.
+        fs::write("style.css", &css_bytes)?;
     }
     let css_write_duration = css_write_timer.elapsed();
 

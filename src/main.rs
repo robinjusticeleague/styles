@@ -254,7 +254,6 @@ fn rebuild_styles(
             .map(|s| s.len() + 2)
             .sum();
         
-        // OPTIMIZATION: Build a byte vector directly to avoid String overhead.
         let mut css_bytes = Vec::with_capacity(total_len_est.max(64));
 
         for (i, k) in keys.iter().enumerate() {
@@ -282,7 +281,6 @@ fn rebuild_styles(
     };
 
     if css_changed {
-        // OPTIMIZATION: Use fs::write for a more efficient single write operation.
         fs::write("style.css", &css_bytes)?;
     }
     let css_write_duration = css_write_timer.elapsed();

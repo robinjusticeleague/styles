@@ -75,9 +75,9 @@ xxhash-rust = "0.8.15"
 # gix = "0.73.0"
 # imara-diff = "0.2.0"
 
-# [build-dependencies]
-# flatc-rust = "0.2.0"
-# toml = "0.9.5"
-# flatbuffers = "25.2.10"
-# cc = "1.2.31"
-# serde = { version = "1.0.219", features = ["derive"] }
+[build-dependencies]
+flatc-rust = "0.2.0"
+toml = "0.9.5"
+flatbuffers = "25.2.10"
+cc = "1.2.31"
+serde = { version = "1.0.219", features = ["derive"] }
