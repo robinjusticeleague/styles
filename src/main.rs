@@ -1,11 +1,11 @@
 use gix::Repository;
-use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::Path;
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::fs;
+use std::env;
 
-// Function to get current time with microseconds
 fn get_timestamp() -> String {
     let now = SystemTime::now();
     let since_epoch = now.duration_since(UNIX_EPOCH).expect("Time went backwards");
@@ -14,113 +14,115 @@ fn get_timestamp() -> String {
     format!("{}.{:06}", secs, micros)
 }
 
-// Function to compute and log changed lines for a file
-fn log_changed_lines(repo: &Repository, path: &Path) -> Result<(), gix::object::find::existing::Error> {
+fn log_changed_lines(repo: &Repository, path: &Path, workdir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let start_time = SystemTime::now();
     
-    let workdir = repo.workdir().expect("Repository has no workdir");
-    let rel_path = match path.strip_prefix(workdir) {
-        Ok(rel) => rel.to_path_buf(),
-        Err(_) => {
-            eprintln!("[{}] Skipping file not in workdir: {:?}", get_timestamp(), path);
-            return Ok(());
-        }
-    };
+    // The path from `notify` is absolute, and our workdir is also canonicalized.
+    let rel_path = path.strip_prefix(workdir)?;
     
-    // Get the current file content
     let current_content = fs::read_to_string(path).unwrap_or_default();
     let current_lines: Vec<&str> = current_content.lines().collect();
     
-    // Get the content from the last commit (HEAD)
-    let head_commit = repo.head_commit().expect("Failed to get HEAD commit");
-    let tree = head_commit.tree().expect("Failed to get tree");
-    let blob = match tree.lookup_entry_by_path(&rel_path)? {
-        Some(entry) => match entry.object() {
-            Ok(obj) => Some(obj.into_blob()),
-            Err(e) => return Err(e),
-        },
-        None => None,
-    };
+    let head_commit = repo.head_commit()?;
+    let tree = head_commit.tree()?;
     
-    let head_content = blob
-        .map(|b| String::from_utf8_lossy(&b.data).to_string())
-        .unwrap_or_default();
+    let head_content = match tree.lookup_entry_by_path(rel_path) {
+        Ok(Some(entry)) => {
+            let blob = entry.object()?.into_blob();
+            String::from_utf8_lossy(&blob.data).to_string()
+        },
+        _ => String::new(), // File is new or not in repo
+    };
     let head_lines: Vec<&str> = head_content.lines().collect();
 
-    // Find changed lines
+    if current_lines == head_lines {
+        // No actual content change, so we can skip logging.
+        return Ok(());
+    }
+
     let mut changes_found = false;
-    for (i, (old_line, new_line)) in head_lines.iter().zip(current_lines.iter()).enumerate() {
+    let max_len = std::cmp::max(head_lines.len(), current_lines.len());
+
+    for i in 0..max_len {
+        let old_line = head_lines.get(i);
+        let new_line = current_lines.get(i);
+
         if old_line != new_line {
             if !changes_found {
-                println!("[{}] Change detected in {:?}", get_timestamp(), rel_path);
+                println!("\n[{}] Change detected in {:?}", get_timestamp(), rel_path);
                 changes_found = true;
             }
-            println!("Line {}: -{}", i + 1, old_line);
-            println!("Line {}: +{}", i + 1, new_line);
+            if let Some(line) = old_line {
+                println!("- Line {}: {}", i + 1, line);
+            }
+            if let Some(line) = new_line {
+                println!("+ Line {}: {}", i + 1, line);
+            }
         }
     }
 
-    // Handle lines added or removed (if lengths differ)
-    if head_lines.len() < current_lines.len() {
-        if !changes_found {
-            println!("[{}] Change detected in {:?}", get_timestamp(), rel_path);
-            changes_found = true;
-        }
-        for (i, line) in current_lines[head_lines.len()..].iter().enumerate() {
-            println!("Line {}: +{}", head_lines.len() + i + 1, line);
-        }
-    } else if head_lines.len() > current_lines.len() {
-        if !changes_found {
-            println!("[{}] Change detected in {:?}", get_timestamp(), rel_path);
-            changes_found = true;
-        }
-        for (i, line) in head_lines[current_lines.len()..].iter().enumerate() {
-            println!("Line {}: -{}", current_lines.len() + i + 1, line);
-        }
-    }
 
-    // Calculate and log time taken
     if changes_found {
-        let duration = start_time.elapsed().expect("Time went backwards");
-        let micros = duration.as_secs() * 1_000_000 + duration.subsec_micros() as u64;
-        println!("Time to log change: {} microseconds", micros);
+        let duration = start_time.elapsed()?;
+        let millis = duration.as_millis();
+        if millis > 0 {
+            println!("Time to log change: {} ms", millis);
+        } else {
+            let micros = duration.as_micros();
+            println!("Time to log change: {} qs", micros);
+        }
     }
 
     Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Open the Git repository in the current directory
-    let repo = gix::open(".")?;
+    // Get the canonical path of the current directory. This is the most reliable way.
+    let workdir = env::current_dir()?.canonicalize()?;
 
-    // Set up the notify watcher
+    // Open the Git repository located in the workdir.
+    let repo = gix::open(&workdir)?;
+
     let (tx, rx) = channel();
     let mut watcher = RecommendedWatcher::new(
         move |res: notify::Result<Event>| {
-            let _ = tx.send(res);
+            if let Ok(event) = res {
+                tx.send(event).unwrap();
+            }
         },
-        Config::default().with_poll_interval(Duration::from_millis(100)),
+        Config::default().with_poll_interval(Duration::from_millis(200)),
     )?;
 
-    // Watch the current directory recursively
-    watcher.watch(Path::new("."), RecursiveMode::Recursive)?;
+    // Construct the watch path from our canonical workdir.
+    let watch_path = workdir.join("test");
+    if !watch_path.exists() {
+        eprintln!("Error: The 'test' directory does not exist in '{}'. Please create it.", workdir.display());
+        return Ok(());
+    }
+    watcher.watch(&watch_path, RecursiveMode::Recursive)?;
 
-    println!("Monitoring Git repository for changes. Press Ctrl+C to stop.");
+    println!("Monitoring '{}' for changes. Press Ctrl+C to stop.", watch_path.display());
 
-    // Main loop to process file system events
     loop {
         match rx.recv() {
-            Ok(Ok(event)) => {
-                for path in event.paths {
-                    // Only process files that exist and are not git internal files
-                    if path.exists() && !path.to_string_lossy().contains(".git/") {
-                        if let Err(e) = log_changed_lines(&repo, &path) {
-                            eprintln!("Error processing file {:?}: {:?}", path, e);
+            Ok(event) => {
+                match event.kind {
+                    // Only act on events that indicate a file's content has changed.
+                    EventKind::Create(_) | EventKind::Modify(_) => {
+                        for path in event.paths {
+                            if path.is_file() {
+                                 // Pass the canonical workdir to the logging function.
+                                if let Err(e) = log_changed_lines(&repo, &path, &workdir) {
+                                    eprintln!("Error processing file '{}': {}", path.display(), e);
+                                }
+                            }
                         }
+                    },
+                    _ => {
+                        // Ignore all other events (Access, Remove, etc.) silently.
                     }
                 }
             }
-            Ok(Err(e)) => eprintln!("Watch error: {:?}", e),
             Err(e) => eprintln!("Channel error: {:?}", e),
         }
     }
