@@ -1,13 +1,9 @@
 use ahash::{AHashMap, AHashSet, AHasher};
 use colored::Colorize;
 use cssparser::serialize_identifier;
-use html5ever::tokenizer::{
-    BufferQueue, TagKind, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts,
-};
 use memmap2::Mmap;
-use notify_debouncer_full::{new_debouncer};
+use notify_debouncer_full::new_debouncer;
 use rayon::prelude::*;
-use std::cell::RefCell;
 use std::fs::File;
 use std::hash::Hasher;
 use std::io::Write as IoWrite;
@@ -15,36 +11,16 @@ use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::System;
-use tendril::{fmt::UTF8, Tendril};
+
+// NEW: fast byte scanning
+use memchr::{memchr, memmem::Finder};
 
 struct AppState {
     html_hash: u64,
     class_cache: AHashSet<String>,
     utility_css_cache: AHashMap<String, String>,
-}
-
-struct ClassExtractor {
-    classes: RefCell<AHashSet<String>>,
-}
-
-impl TokenSink for ClassExtractor {
-    type Handle = ();
-
-    fn process_token(&self, token: Token, _line_number: u64) -> TokenSinkResult<Self::Handle> {
-        if let Token::TagToken(tag) = token {
-            if tag.kind == TagKind::StartTag {
-                for attr in tag.attrs.iter() {
-                    if &*attr.name.local == "class" {
-                        let mut classes = self.classes.borrow_mut();
-                        for class in attr.value.split_whitespace() {
-                            classes.insert(class.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        TokenSinkResult::Continue
-    }
+    // NEW: track css hash to skip unchanged writes
+    css_hash: u64,
 }
 
 fn print_system_info() {
@@ -78,16 +54,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         html_hash: 0,
         class_cache: AHashSet::default(),
         utility_css_cache: AHashMap::default(),
+        css_hash: 0,
     }));
 
     rebuild_styles(app_state.clone(), true)?;
 
     let (tx, rx) = mpsc::channel();
-    
-    let mut debouncer = new_debouncer(Duration::from_millis(50), None, tx)?;
 
-    debouncer
-        .watch(Path::new("index.html"), notify::RecursiveMode::NonRecursive)?;
+    // LOWER debounce to reduce latency
+    let mut debouncer = new_debouncer(Duration::from_millis(1), None, tx)?;
+    debouncer.watch(Path::new("index.html"), notify::RecursiveMode::NonRecursive)?;
 
     println!("{}", "Watching index.html for changes...".cyan());
 
@@ -105,12 +81,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// Fast path: extract classes by scanning bytes for class="..."/class='...'
+fn extract_classes_fast(html_bytes: &[u8], capacity_hint: usize) -> AHashSet<String> {
+    let mut set = AHashSet::with_capacity(capacity_hint.max(64));
+    let finder = Finder::new(b"class");
+    let mut pos = 0usize;
+    let n = html_bytes.len();
+
+    while let Some(idx) = finder.find(&html_bytes[pos..]) {
+        let start = pos + idx + 5; // after "class"
+        // skip spaces
+        let mut i = start;
+        while i < n && (html_bytes[i] == b' ' || html_bytes[i] == b'\n' || html_bytes[i] == b'\r' || html_bytes[i] == b'\t') {
+            i += 1;
+        }
+        if i >= n || html_bytes[i] != b'=' {
+            pos = start;
+            continue;
+        }
+        i += 1;
+        while i < n && (html_bytes[i] == b' ' || html_bytes[i] == b'\n' || html_bytes[i] == b'\r' || html_bytes[i] == b'\t') {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        let quote = html_bytes[i];
+        if quote != b'"' && quote != b'\'' {
+            pos = i;
+            continue;
+        }
+        i += 1;
+        let value_start = i;
+        // find closing quote
+        let rel_end = memchr(quote, &html_bytes[value_start..]);
+        let value_end = match rel_end {
+            Some(off) => value_start + off,
+            None => break,
+        };
+        if let Ok(value_str) = std::str::from_utf8(&html_bytes[value_start..value_end]) {
+            for cls in value_str.split_whitespace() {
+                if !cls.is_empty() {
+                    set.insert(cls.to_string());
+                }
+            }
+        }
+        pos = value_end + 1;
+    }
+
+    set
+}
+
 fn rebuild_styles(
     state: Arc<Mutex<AppState>>,
     is_initial_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let total_start = Instant::now();
 
+    // Map file (fast) and hash contents to skip unchanged work
     let html_file = File::open("index.html")?;
     let html_mmap = unsafe { Mmap::map(&html_file)? };
 
@@ -120,105 +148,185 @@ fn rebuild_styles(
         hasher.finish()
     };
 
-    let (old_hash, old_class_cache) = {
+    // Quick skip if hash unchanged
+    {
         let state_guard = state.lock().unwrap();
-        (state_guard.html_hash, state_guard.class_cache.clone())
-    };
-
-    if !is_initial_run && old_hash == new_html_hash {
-        return Ok(());
+        if !is_initial_run && state_guard.html_hash == new_html_hash {
+            return Ok(());
+        }
     }
 
-    let html_content = std::str::from_utf8(&html_mmap)?;
-
-    let timer = Instant::now();
-    let sink = ClassExtractor {
-        classes: RefCell::new(AHashSet::with_capacity(256)),
+    // FAST class extraction
+    let parse_timer = Instant::now();
+    let prev_len_hint = {
+        let state_guard = state.lock().unwrap();
+        state_guard.class_cache.len()
     };
-    let tokenizer = Tokenizer::new(sink, TokenizerOpts::default());
-    let mut buffer = BufferQueue::default();
-    let tendril = Tendril::<UTF8>::from_slice(html_content);
-    buffer.push_back(tendril.try_reinterpret().unwrap());
-    let _ = tokenizer.feed(&mut buffer);
-    tokenizer.end();
-    let all_classes = tokenizer.sink.classes.into_inner();
-    let parse_extract_duration = timer.elapsed();
+    let all_classes = extract_classes_fast(&html_mmap, prev_len_hint.next_power_of_two());
+    let parse_extract_duration = parse_timer.elapsed();
 
-    let timer = Instant::now();
-    let added: Vec<_> = all_classes.difference(&old_class_cache).cloned().collect();
-    let removed: Vec<_> = old_class_cache.difference(&all_classes).cloned().collect();
-    let diff_duration = timer.elapsed();
+    // Compute diffs without cloning the entire old cache
+    let diff_timer = Instant::now();
+    let (added, removed, old_hash_just_for_info) = {
+        let state_guard = state.lock().unwrap();
 
-    if !added.is_empty() || !removed.is_empty() {
-        let added_count = added.len();
-        let removed_count = removed.len();
-
-        let timer = Instant::now();
-        let new_rules: Vec<(String, String)> = added
-            .par_iter()
-            .map(|class| {
-                let mut escaped_class = String::with_capacity(class.len());
-                serialize_identifier(class, &mut escaped_class).unwrap();
-                let rule = format!(".{} {{\n  display: flex;\n}}", escaped_class);
-                (class.clone(), rule)
-            })
-            .collect();
-        let cache_update_duration = timer.elapsed();
-
-        let css_write_timer = Instant::now();
-        let utility_css_cache = {
-            let mut state_guard = state.lock().unwrap();
-            state_guard.html_hash = new_html_hash;
-            state_guard.class_cache = all_classes;
-            for class in removed.iter() {
-                state_guard.utility_css_cache.remove(class);
-            }
-            state_guard.utility_css_cache.extend(new_rules);
-            state_guard.utility_css_cache.clone()
-        };
-
-        let mut sorted_classes: Vec<_> = utility_css_cache.keys().cloned().collect();
-        sorted_classes.par_sort_unstable();
-
-        let estimated_capacity = utility_css_cache.len() * 60;
-        let mut css_content = String::with_capacity(estimated_capacity);
-
-        for (i, class_name) in sorted_classes.iter().enumerate() {
-            if i > 0 {
-                css_content.push_str("\n\n");
-            }
-            if let Some(rule) = utility_css_cache.get(class_name) {
-                css_content.push_str(rule);
-            }
-        }
-        if !utility_css_cache.is_empty() {
-            css_content.push('\n');
+        // if HTML hash unchanged (race), skip
+        if !is_initial_run && state_guard.html_hash == new_html_hash {
+            return Ok(());
         }
 
-        let mut file = File::create("style.css")?;
-        file.write_all(css_content.as_bytes())?;
-        let css_write_duration = css_write_timer.elapsed();
+        let old = &state_guard.class_cache;
+
+        // added = all_classes - old
+        let mut added = Vec::with_capacity(all_classes.len().saturating_sub(old.len()).max(4));
+        for c in all_classes.iter() {
+            if !old.contains(c) {
+                added.push(c.clone());
+            }
+        }
+
+        // removed = old - all_classes
+        let mut removed = Vec::with_capacity(old.len().saturating_sub(all_classes.len()).max(4));
+        for c in old.iter() {
+            if !all_classes.contains(c) {
+                removed.push(c.clone());
+            }
+        }
+
+        (added, removed, state_guard.html_hash)
+    };
+    let diff_duration = diff_timer.elapsed();
+
+    // Nothing to do if class set identical (even if hash differs)
+    if added.is_empty() && removed.is_empty() {
+        // Update html hash to avoid reprocessing the same content again
+        let mut state_guard = state.lock().unwrap();
+        state_guard.html_hash = new_html_hash;
 
         let wall_time = total_start.elapsed();
-        let processing_time =
-            parse_extract_duration + diff_duration + cache_update_duration + css_write_duration;
-
+        let processing_time = parse_extract_duration + diff_duration;
         let timing_details = format!(
-            "Wall: {} (Processing: {} [Parse: {}, Diff: {}, Cache: {}, CSS Write: {}])",
+            "Wall: {} (Processing: {} [Parse: {}, Diff: {}])",
             format_duration(wall_time),
             format_duration(processing_time),
             format_duration(parse_extract_duration),
             format_duration(diff_duration),
-            format_duration(cache_update_duration),
-            format_duration(css_write_duration)
         );
         println!(
             "Processed: {} added, {} removed | {}",
-            format!("{}", added_count).green(),
-            format!("{}", removed_count).red(),
+            format!("{}", 0).green(),
+            format!("{}", 0).red(),
             timing_details.bright_black()
         );
+        return Ok(());
     }
+
+    // Generate CSS rules for newly added classes
+    const PAR_THRESHOLD: usize = 512;
+    let cache_update_timer = Instant::now();
+    let new_rules: Vec<(String, String)> = if added.len() >= PAR_THRESHOLD {
+        added
+            .par_iter()
+            .map(|class| {
+                let mut escaped = String::with_capacity(class.len());
+                serialize_identifier(class, &mut escaped).unwrap();
+                let rule = format!(".{} {{\n  display: flex;\n}}", escaped);
+                (class.clone(), rule)
+            })
+            .collect()
+    } else {
+        let mut v = Vec::with_capacity(added.len());
+        for class in &added {
+            let mut escaped = String::with_capacity(class.len());
+            serialize_identifier(class, &mut escaped).unwrap();
+            let rule = format!(".{} {{\n  display: flex;\n}}", escaped);
+            v.push((class.clone(), rule));
+        }
+        v
+    };
+    let cache_update_duration = cache_update_timer.elapsed();
+
+    // Update caches and build CSS content (single pass)
+    let css_write_timer = Instant::now();
+    let mut css_content = String::new();
+    let mut css_changed = true;
+    {
+        let mut state_guard = state.lock().unwrap();
+
+        // apply changes
+        state_guard.html_hash = new_html_hash;
+        for class in removed.iter() {
+            state_guard.utility_css_cache.remove(class);
+        }
+        if !new_rules.is_empty() {
+            state_guard.utility_css_cache.extend(new_rules);
+        }
+
+        // Build CSS content deterministically (sorted keys)
+        let mut keys: Vec<&String> = state_guard.utility_css_cache.keys().collect();
+        if keys.len() >= PAR_THRESHOLD {
+            keys.par_sort_unstable();
+        } else {
+            keys.sort_unstable();
+        }
+
+        // better capacity estimate using actual rule sizes
+        let total_len_est: usize = state_guard
+            .utility_css_cache
+            .values()
+            .map(|s| s.len() + 2) // include spacing
+            .sum();
+        css_content = String::with_capacity(total_len_est.max(64));
+
+        for (i, k) in keys.iter().enumerate() {
+            if i > 0 {
+                css_content.push_str("\n\n");
+            }
+            if let Some(rule) = state_guard.utility_css_cache.get(*k) {
+                css_content.push_str(rule);
+            }
+        }
+        if !state_guard.utility_css_cache.is_empty() {
+            css_content.push('\n');
+        }
+
+        // Skip file IO if CSS identical
+        let mut hasher = AHasher::default();
+        hasher.write(css_content.as_bytes());
+        let new_css_hash = hasher.finish();
+        if !is_initial_run && new_css_hash == state_guard.css_hash {
+            css_changed = false;
+        } else {
+            state_guard.css_hash = new_css_hash;
+        }
+    }
+
+    if css_changed {
+        let mut file = File::create("style.css")?;
+        file.write_all(css_content.as_bytes())?;
+    }
+    let css_write_duration = css_write_timer.elapsed();
+
+    let wall_time = total_start.elapsed();
+    let processing_time =
+        parse_extract_duration + diff_duration + cache_update_duration + css_write_duration;
+
+    let timing_details = format!(
+        "Wall: {} (Processing: {} [Parse: {}, Diff: {}, Cache: {}, CSS Write: {}])",
+        format_duration(wall_time),
+        format_duration(processing_time),
+        format_duration(parse_extract_duration),
+        format_duration(diff_duration),
+        format_duration(cache_update_duration),
+        format_duration(css_write_duration)
+    );
+    println!(
+        "Processed: {} added, {} removed (prev hash: {:x}) | {}",
+        format!("{}", added.len()).green(),
+        format!("{}", removed.len()).red(),
+        old_hash_just_for_info,
+        timing_details.bright_black()
+    );
 
     Ok(())
 }
