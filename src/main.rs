@@ -2,13 +2,11 @@ use ahash::{AHashSet, AHasher};
 use colored::Colorize;
 use cssparser::serialize_identifier;
 use memchr::{memchr, memmem::Finder};
-use memmap2::MmapOptions;
 use notify_debouncer_full::new_debouncer;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::hash::Hasher;
-use std::io::{BufWriter, Write as IoWrite};
 use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -19,7 +17,6 @@ struct AppState {
     class_cache: AHashSet<String>,
     utility_css_cache: BTreeMap<String, String>,
     css_hash: u64,
-    css_buffer: Vec<u8>,
 }
 
 fn print_system_info() {
@@ -39,20 +36,7 @@ fn print_system_info() {
 }
 
 fn write_css_optimized(path: &str, data: &[u8]) -> std::io::Result<()> {
-    const MMAP_THRESHOLD: usize = 2 * 1024 * 1024;
-    if data.len() < MMAP_THRESHOLD {
-        let file = File::create(path)?;
-        let capacity = data.len().max(8192);
-        let mut buf = BufWriter::with_capacity(capacity, file);
-        buf.write_all(data)?;
-        buf.flush()?;
-    } else {
-        let file = File::options().read(true).write(true).create(true).open(path)?;
-        file.set_len(data.len() as u64)?;
-        let mut mmap = unsafe { MmapOptions::new().map_mut(&file)? };
-        mmap[..data.len()].copy_from_slice(data);
-    }
-    Ok(())
+    fs::write(path, data)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -71,7 +55,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         class_cache: AHashSet::default(),
         utility_css_cache: BTreeMap::default(),
         css_hash: 0,
-        css_buffer: Vec::with_capacity(1024),
     }));
 
     rebuild_styles(app_state.clone(), true)?;
@@ -268,15 +251,9 @@ fn rebuild_styles(
         let mut hasher = AHasher::default();
         hasher.write(&css_buffer);
         let new_css_hash = hasher.finish();
-        let css_changed_flag = if !is_initial_run && new_css_hash == state_guard.css_hash {
-            false
-        } else {
-            state_guard.css_hash = new_css_hash;
-            state_guard.css_buffer = css_buffer.clone();
-            true
-        };
-
+        let css_changed_flag = is_initial_run || new_css_hash != state_guard.css_hash;
         if css_changed_flag {
+            state_guard.css_hash = new_css_hash;
             Some(css_buffer)
         } else {
             None
