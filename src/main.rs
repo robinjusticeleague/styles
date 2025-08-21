@@ -196,7 +196,7 @@ fn rebuild_styles(
             .map(|class| {
                 let mut escaped_class = String::new();
                 serialize_identifier(class.as_str(), &mut escaped_class).unwrap();
-                let rule = format!(".{} {{\n  display: flex;\n}}\n\n", escaped_class);
+                let rule = format!(".{} {{\n  display: flex;\n}}", escaped_class);
                 (class.clone(), rule)
             })
             .collect();
@@ -211,10 +211,18 @@ fn rebuild_styles(
         let file = File::create("style.css")?;
         let mut writer = BufWriter::with_capacity(state_guard.utility_css_cache.len() * 50, file);
 
+        let mut first = true;
         for class_name in sorted_classes {
             if let Some(rule) = state_guard.utility_css_cache.get(&class_name) {
+                if !first {
+                    writer.write_all(b"\n\n")?;
+                }
                 writer.write_all(rule.as_bytes())?;
+                first = false;
             }
+        }
+        if !first {
+            writer.write_all(b"\n")?;
         }
         writer.flush()?;
         let css_write_duration = css_write_timer.elapsed();
