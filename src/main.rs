@@ -242,7 +242,7 @@ fn rebuild_styles(
         if let Some(first) = iter.next() {
             css_buffer.extend_from_slice(first.as_bytes());
             for v in iter {
-                css_buffer.extend_from_slice(b"\n\n");
+                css_buffer.extend_from_slice(b"\n");
                 css_buffer.extend_from_slice(v.as_bytes());
             }
             css_buffer.push(b'\n');
