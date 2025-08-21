@@ -48,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     rebuild_styles(true)?;
 
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut debouncer = new_debouncer(Duration::from_millis(50), None, tx)?;
+    let mut debouncer = new_debouncer(Duration::from_millis(1), None, tx)?;
 
     debouncer.watch(Path::new("index.html"), notify::RecursiveMode::NonRecursive)?;
 
