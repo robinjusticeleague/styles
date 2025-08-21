@@ -1,6 +1,11 @@
 # Dx
 Enhance Developer Experience
 
+```bash
+cargo watch -c -x run
+cargo watch -x "run -- --port 8080 --mode dev"
+```
+
 Figured out how to use scss in dx-styles
 [dependencies]
 # For fast JS/TS parsing
