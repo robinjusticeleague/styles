@@ -20,6 +20,8 @@ regex = "1.11.1"
 seahash = "4.1.0"
 sysinfo = "0.37.0"
 tendril = "0.4.3"
+twox-hash = "2.1.1"
+xxhash-rust = "0.8.15"
 
 # [dependencies]
 # colored = "3.0.0"
