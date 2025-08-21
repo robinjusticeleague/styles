@@ -2,12 +2,12 @@ use ahash::{AHashMap, AHashSet, AHasher};
 use colored::Colorize;
 use cssparser::serialize_identifier;
 use memchr::{memchr, memmem::Finder};
+use memmap2::MmapOptions;
 use notify_debouncer_full::new_debouncer;
 use rayon::prelude::*;
-use std::fs;
-use std::fs::File;
+use std::fs::{self, File};
 use std::hash::Hasher;
-use std::io::Write as IoWrite;
+use std::io::{BufWriter, Write as IoWrite};
 use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,6 +18,7 @@ struct AppState {
     class_cache: AHashSet<String>,
     utility_css_cache: AHashMap<String, String>,
     css_hash: u64,
+    css_buffer: Vec<u8>,
 }
 
 fn print_system_info() {
@@ -36,6 +37,22 @@ fn print_system_info() {
     );
 }
 
+fn write_css_optimized(path: &str, data: &[u8]) -> std::io::Result<()> {
+    const MMAP_THRESHOLD: usize = 2 * 1024 * 1024;
+    if data.len() < MMAP_THRESHOLD {
+        let file = File::create(path)?;
+        let mut buf = BufWriter::with_capacity(64 * 1024, file);
+        buf.write_all(data)?;
+        buf.flush()?;
+    } else {
+        let file = File::options().read(true).write(true).create(true).open(path)?;
+        file.set_len(data.len() as u64)?;
+        let mut mmap = unsafe { MmapOptions::new().map_mut(&file)? };
+        mmap[..data.len()].copy_from_slice(data);
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", "Starting DX Style Engine...".cyan());
     print_system_info();
@@ -52,18 +69,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         class_cache: AHashSet::default(),
         utility_css_cache: AHashMap::default(),
         css_hash: 0,
+        css_buffer: Vec::with_capacity(1024),
     }));
 
     rebuild_styles(app_state.clone(), true)?;
 
     let (tx, rx) = mpsc::channel();
-
     let mut debouncer = new_debouncer(Duration::from_millis(1), None, tx)?;
-    debouncer.watch(
-        Path::new("index.html"),
-        notify::RecursiveMode::NonRecursive,
-    )?;
-
+    debouncer.watch(Path::new("index.html"), notify::RecursiveMode::NonRecursive)?;
     println!("{}", "Watching index.html for changes...".cyan());
 
     for res in rx {
@@ -89,12 +102,7 @@ fn extract_classes_fast(html_bytes: &[u8], capacity_hint: usize) -> AHashSet<Str
     while let Some(idx) = finder.find(&html_bytes[pos..]) {
         let start = pos + idx + 5;
         let mut i = start;
-        while i < n
-            && (html_bytes[i] == b' '
-                || html_bytes[i] == b'\n'
-                || html_bytes[i] == b'\r'
-                || html_bytes[i] == b'\t')
-        {
+        while i < n && matches!(html_bytes[i], b' ' | b'\n' | b'\r' | b'\t') {
             i += 1;
         }
         if i >= n || html_bytes[i] != b'=' {
@@ -102,12 +110,7 @@ fn extract_classes_fast(html_bytes: &[u8], capacity_hint: usize) -> AHashSet<Str
             continue;
         }
         i += 1;
-        while i < n
-            && (html_bytes[i] == b' '
-                || html_bytes[i] == b'\n'
-                || html_bytes[i] == b'\r'
-                || html_bytes[i] == b'\t')
-        {
+        while i < n && matches!(html_bytes[i], b' ' | b'\n' | b'\r' | b'\t') {
             i += 1;
         }
         if i >= n {
@@ -186,18 +189,14 @@ fn rebuild_styles(
 
         let wall_time = total_start.elapsed();
         let processing_time = parse_extract_duration + diff_duration;
-        let timing_details = format!(
-            "Wall: {} (Processing: {} [Parse: {}, Diff: {}])",
+        println!(
+            "Processed: {} added, {} removed | Wall: {} (Processing: {} [Parse: {}, Diff: {}])",
+            format!("{}", 0).green(),
+            format!("{}", 0).red(),
             format_duration(wall_time),
             format_duration(processing_time),
             format_duration(parse_extract_duration),
             format_duration(diff_duration),
-        );
-        println!(
-            "Processed: {} added, {} removed | {}",
-            format!("{}", 0).green(),
-            format!("{}", 0).red(),
-            timing_details.bright_black()
         );
         return Ok(());
     }
@@ -215,12 +214,13 @@ fn rebuild_styles(
             })
             .collect()
     } else {
+        let mut escaped = String::with_capacity(128);
         added
             .iter()
             .map(|class| {
-                let mut escaped = String::with_capacity(class.len());
+                escaped.clear();
                 serialize_identifier(class, &mut escaped).unwrap();
-                let rule = format!(".{} {{\n  display: flex;\n}}", escaped);
+                let rule = format!(".{} {{\n  display: flex;\n}}", &escaped);
                 (class.clone(), rule)
             })
             .collect()
@@ -241,7 +241,12 @@ fn rebuild_styles(
             state_guard.utility_css_cache.extend(new_rules);
         }
 
-        let mut keys: Vec<&String> = state_guard.utility_css_cache.keys().collect();
+        let mut keys: Vec<String> = state_guard
+            .utility_css_cache
+            .keys()
+            .cloned()
+            .collect();
+
         if keys.len() >= PAR_THRESHOLD {
             keys.par_sort_unstable();
         } else {
@@ -253,23 +258,27 @@ fn rebuild_styles(
             .values()
             .map(|s| s.len() + 2)
             .sum();
-        
-        let mut css_bytes = Vec::with_capacity(total_len_est.max(64));
 
-        for (i, k) in keys.iter().enumerate() {
+        let rules_bytes: Vec<Vec<u8>> = keys
+            .into_iter()
+            .map(|k| state_guard.utility_css_cache.get(&k).unwrap().as_bytes().to_vec())
+            .collect();
+
+        state_guard.css_buffer.clear();
+        state_guard.css_buffer.reserve(total_len_est.max(64));
+
+        for (i, rule) in rules_bytes.iter().enumerate() {
             if i > 0 {
-                css_bytes.write_all(b"\n\n").unwrap();
+                state_guard.css_buffer.extend_from_slice(b"\n\n");
             }
-            if let Some(rule) = state_guard.utility_css_cache.get(*k) {
-                css_bytes.write_all(rule.as_bytes()).unwrap();
-            }
+            state_guard.css_buffer.extend_from_slice(rule);
         }
         if !state_guard.utility_css_cache.is_empty() {
-            css_bytes.write_all(b"\n").unwrap();
+            state_guard.css_buffer.extend_from_slice(b"\n");
         }
 
         let mut hasher = AHasher::default();
-        hasher.write(&css_bytes);
+        hasher.write(&state_guard.css_buffer);
         let new_css_hash = hasher.finish();
         let css_changed_flag = if !is_initial_run && new_css_hash == state_guard.css_hash {
             false
@@ -277,11 +286,11 @@ fn rebuild_styles(
             state_guard.css_hash = new_css_hash;
             true
         };
-        (css_bytes, css_changed_flag)
-    };
 
+        (state_guard.css_buffer.clone(), css_changed_flag)
+    };
     if css_changed {
-        fs::write("style.css", &css_bytes)?;
+        write_css_optimized("style.css", &css_bytes)?;
     }
     let css_write_duration = css_write_timer.elapsed();
 
@@ -289,21 +298,17 @@ fn rebuild_styles(
     let processing_time =
         parse_extract_duration + diff_duration + cache_update_duration + css_write_duration;
 
-    let timing_details = format!(
-        "Wall: {} (Processing: {} [Parse: {}, Diff: {}, Cache: {}, CSS Write: {}])",
+    println!(
+        "Processed: {} added, {} removed (prev hash: {:x}) | Wall: {} (Processing: {} [Parse: {}, Diff: {}, Cache: {}, CSS Write: {}])",
+        format!("{}", added.len()).green(),
+        format!("{}", removed.len()).red(),
+        old_hash_just_for_info,
         format_duration(wall_time),
         format_duration(processing_time),
         format_duration(parse_extract_duration),
         format_duration(diff_duration),
         format_duration(cache_update_duration),
         format_duration(css_write_duration)
-    );
-    println!(
-        "Processed: {} added, {} removed (prev hash: {:x}) | {}",
-        format!("{}", added.len()).green(),
-        format!("{}", removed.len()).red(),
-        old_hash_just_for_info,
-        timing_details.bright_black()
     );
 
     Ok(())
