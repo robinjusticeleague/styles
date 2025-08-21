@@ -1,6 +1,47 @@
 # Dx
 Enhance Developer Experience
 
+Organize this big files in these folders and give me all files in canvas mode correctly:
+```md
+src/
+├── main.rs
+
+├── state/
+
+│   └── mod.rs
+
+├── system_info/
+
+│   └── mod.rs
+
+├── watcher/
+
+│   └── mod.rs
+
+├── extractor/
+
+│   └── mod.rs
+
+├── css_builder/
+
+│   └── mod.rs
+
+├── timing/
+
+│   └── mod.rs
+
+```
+
+
+
+
+
+
+
+
+
+
+## Other Stuffs
 ```bash
 npx @tailwindcss/cli -i ./style.css -o ./output.css --watch
 cargo watch -c -x run
