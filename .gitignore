@@ -5,3 +5,4 @@ flatbuffers-23.5.26
 .dx/*
 .dx/cache
 inspiration
+node_modules

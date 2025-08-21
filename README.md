@@ -2,6 +2,7 @@
 Enhance Developer Experience
 
 ```bash
+npx @tailwindcss/cli -i ./style.css -o ./output.css --watch
 cargo watch -c -x run
 cargo watch -x "run -- --port 8080 --mode dev"
 ```
