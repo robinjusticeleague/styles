@@ -1,4 +1,8 @@
-.bg-red-500 {
+.text-8xl {
+  display: flex;
+}
+
+.bg-blue-500 {
   display: flex;
 }
 
@@ -7,10 +11,6 @@
 }
 
 .text-7xl {
-  display: flex;
-}
-
-.text-8xl {
   display: flex;
 }
 
