@@ -1,11 +1,111 @@
-.\+card\(flex\ text-md\ p-4\) {
+.bg-emerald-500 {
   display: flex;
 }
 
-.grid {
+.card {
   display: flex;
 }
 
-.op {
+.container {
+  display: flex;
+}
+
+.flex {
+  display: flex;
+}
+
+.flex-col {
+  display: flex;
+}
+
+.flex-row-reverse {
+  display: flex;
+}
+
+.gap-8 {
+  display: flex;
+}
+
+.h-28 {
+  display: flex;
+}
+
+.h-44 {
+  display: flex;
+}
+
+.h-screen {
+  display: flex;
+}
+
+.items-center {
+  display: flex;
+}
+
+.justify-center {
+  display: flex;
+}
+
+.lg\:w-80 {
+  display: flex;
+}
+
+.mb-4 {
+  display: flex;
+}
+
+.object-cover {
+  display: flex;
+}
+
+.object-left-top {
+  display: flex;
+}
+
+.object-top {
+  display: flex;
+}
+
+.pb-28 {
+  display: flex;
+}
+
+.pt-28 {
+  display: flex;
+}
+
+.rounded-full {
+  display: flex;
+}
+
+.rounded-md {
+  display: flex;
+}
+
+.text-black {
+  display: flex;
+}
+
+.text-lg {
+  display: flex;
+}
+
+.text-sm {
+  display: flex;
+}
+
+.text-white {
+  display: flex;
+}
+
+.w-28 {
+  display: flex;
+}
+
+.w-44 {
+  display: flex;
+}
+
+.w-full {
   display: flex;
 }

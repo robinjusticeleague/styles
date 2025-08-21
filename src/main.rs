@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     rebuild_styles(app_state.clone(), true)?;
 
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut debouncer = new_debouncer(Duration::ZERO, None, tx)?;
+    let mut debouncer = new_debouncer(Duration::from_millis(50), None, tx)?;
 
     debouncer.watch(Path::new("index.html"), notify::RecursiveMode::NonRecursive)?;
 
@@ -227,10 +227,13 @@ fn rebuild_styles(
         writer.flush()?;
         let css_write_duration = css_write_timer.elapsed();
 
-        let total_duration = total_start.elapsed();
+        let wall_time = total_start.elapsed();
+        let processing_time = parse_extract_duration + diff_duration + cache_update_duration + css_write_duration;
+
         let timing_details = format!(
-            "Total: {} (Parse: {}, Diff: {}, Cache: {}, CSS Write: {})",
-            format_duration(total_duration),
+            "Wall: {} (Processing: {} [Parse: {}, Diff: {}, Cache: {}, CSS Write: {}])",
+            format_duration(wall_time),
+            format_duration(processing_time),
             format_duration(parse_extract_duration),
             format_duration(diff_duration),
             format_duration(cache_update_duration),
