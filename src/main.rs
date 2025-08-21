@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     rebuild_styles(app_state.clone(), true)?;
 
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut debouncer = new_debouncer(Duration::from_millis(1), None, tx)?;
+    let mut debouncer = new_debouncer(Duration::ZERO, None, tx)?;
 
     debouncer.watch(Path::new("index.html"), notify::RecursiveMode::NonRecursive)?;
 
@@ -165,7 +165,7 @@ fn rebuild_styles(
     let sink = ClassExtractor {
         classes: RefCell::new(HashSet::with_capacity(256)),
     };
-    let mut tokenizer = Tokenizer::new(sink, TokenizerOpts::default());
+    let tokenizer = Tokenizer::new(sink, TokenizerOpts::default());
     let mut buffer = BufferQueue::default();
     let tendril = Tendril::<UTF8>::from_slice(html_content);
     buffer.push_back(tendril.try_reinterpret().unwrap());
