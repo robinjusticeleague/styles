@@ -4,12 +4,21 @@ Enhance Developer Experience
 ```bash
 git clone https://github.com/google/flatbuffers.git
 
-cd flatbuffers
+cd flatbuffers && rm -rf .git
 mkdir build
 cd build
 
+cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=~/.local
+
 cmake ..
-make
+make -j
+make install
+
+export PATH=~/.local/bin:$PATH
+
+which flatc
+
+flatc --version
 ```
 
 

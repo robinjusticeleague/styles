@@ -3,7 +3,6 @@
   packages = [
     pkgs.gcc
     pkgs.rustup
-    pkgs.flatbuffers
     pkgs.bun
     pkgs.tree
     pkgs.gnumake
