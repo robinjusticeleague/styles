@@ -1,7 +1,18 @@
 # Dx
 Enhance Developer Experience
 
+```bash
+git clone https://github.com/google/flatbuffers.git
+
+cd flatbuffers
+mkdir build
+cd build
+
+```
+
+
 Organize this big files in these folders and give me all files in canvas mode correctly:
+
 ```md
 src/
 ├── main.rs
@@ -31,15 +42,6 @@ src/
 │   └── mod.rs
 
 ```
-
-
-
-
-
-
-
-
-
 
 ## Other Stuffs
 ```bash
