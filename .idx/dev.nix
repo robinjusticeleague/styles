@@ -6,6 +6,8 @@
     pkgs.flatbuffers
     pkgs.bun
     pkgs.tree
+    pkgs.gnumake
+    pkgs.cmake
   ];
   env = { };
   idx = {
