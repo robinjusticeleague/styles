@@ -4,12 +4,13 @@ Enhance Developer Experience
 ```bash
 git clone https://github.com/google/flatbuffers.git
 
-cd flatbuffers
+cd flatbuffers && rm -rf .git
 mkdir build
 cd build
 
 cmake ..
 make
+make install
 ```
 
 
