@@ -4,6 +4,7 @@ version = "0.0.0"
 edition = "2024"
 
 [dependencies]
+diff = "0.1.13"
 gix = "0.73.0"
 imara-diff = "0.2.0"
 notify = "8.2.0"

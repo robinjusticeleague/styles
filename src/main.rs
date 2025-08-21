@@ -5,6 +5,8 @@ use std::sync::mpsc::channel;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::fs;
 use std::env;
+// Add this to your Cargo.toml file: diff = "0.1.13"
+use diff;
 
 fn get_timestamp() -> String {
     let now = SystemTime::now();
@@ -17,11 +19,9 @@ fn get_timestamp() -> String {
 fn log_changed_lines(repo: &Repository, path: &Path, workdir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let start_time = SystemTime::now();
     
-    // The path from `notify` is absolute, and our workdir is also canonicalized.
     let rel_path = path.strip_prefix(workdir)?;
     
     let current_content = fs::read_to_string(path).unwrap_or_default();
-    let current_lines: Vec<&str> = current_content.lines().collect();
     
     let head_commit = repo.head_commit()?;
     let tree = head_commit.tree()?;
@@ -31,36 +31,24 @@ fn log_changed_lines(repo: &Repository, path: &Path, workdir: &Path) -> Result<(
             let blob = entry.object()?.into_blob();
             String::from_utf8_lossy(&blob.data).to_string()
         },
-        _ => String::new(), // File is new or not in repo
+        _ => String::new(),
     };
-    let head_lines: Vec<&str> = head_content.lines().collect();
 
-    if current_lines == head_lines {
-        // No actual content change, so we can skip logging.
+    if current_content == head_content {
         return Ok(());
     }
 
+    println!("\n[{}] Change detected in {:?}", get_timestamp(), rel_path);
+    
     let mut changes_found = false;
-    let max_len = std::cmp::max(head_lines.len(), current_lines.len());
-
-    for i in 0..max_len {
-        let old_line = head_lines.get(i);
-        let new_line = current_lines.get(i);
-
-        if old_line != new_line {
-            if !changes_found {
-                println!("\n[{}] Change detected in {:?}", get_timestamp(), rel_path);
-                changes_found = true;
-            }
-            if let Some(line) = old_line {
-                println!("- Line {}: {}", i + 1, line);
-            }
-            if let Some(line) = new_line {
-                println!("+ Line {}: {}", i + 1, line);
-            }
+    for diff in diff::lines(&head_content, &current_content) {
+        changes_found = true;
+        match diff {
+            diff::Result::Left(l)    => println!("- {}", l),
+            diff::Result::Right(r)   => println!("+ {}", r),
+            diff::Result::Both(_, _) => (),
         }
     }
-
 
     if changes_found {
         let duration = start_time.elapsed()?;
@@ -77,10 +65,7 @@ fn log_changed_lines(repo: &Repository, path: &Path, workdir: &Path) -> Result<(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Get the canonical path of the current directory. This is the most reliable way.
     let workdir = env::current_dir()?.canonicalize()?;
-
-    // Open the Git repository located in the workdir.
     let repo = gix::open(&workdir)?;
 
     let (tx, rx) = channel();
@@ -93,7 +78,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Config::default().with_poll_interval(Duration::from_millis(200)),
     )?;
 
-    // Construct the watch path from our canonical workdir.
     let watch_path = workdir.join("test");
     if !watch_path.exists() {
         eprintln!("Error: The 'test' directory does not exist in '{}'. Please create it.", workdir.display());
@@ -107,20 +91,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match rx.recv() {
             Ok(event) => {
                 match event.kind {
-                    // Only act on events that indicate a file's content has changed.
                     EventKind::Create(_) | EventKind::Modify(_) => {
                         for path in event.paths {
                             if path.is_file() {
-                                 // Pass the canonical workdir to the logging function.
                                 if let Err(e) = log_changed_lines(&repo, &path, &workdir) {
                                     eprintln!("Error processing file '{}': {}", path.display(), e);
                                 }
                             }
                         }
                     },
-                    _ => {
-                        // Ignore all other events (Access, Remove, etc.) silently.
-                    }
+                    _ => {}
                 }
             }
             Err(e) => eprintln!("Channel error: {:?}", e),
