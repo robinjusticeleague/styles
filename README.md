@@ -2,6 +2,7 @@
 Enhance Developer Experience
 
 ```bash
+cargo add ahash colored cssparser memchr notify_debouncer_full rayon notify
 git clone https://github.com/google/flatbuffers.git
 
 cd flatbuffers && rm -rf .git

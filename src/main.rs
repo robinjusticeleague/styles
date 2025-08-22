@@ -10,7 +10,6 @@ use std::hash::Hasher;
 use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
-use sysinfo::System;
 
 struct AppState {
     html_hash: u64,
@@ -19,29 +18,12 @@ struct AppState {
     css_hash: u64,
 }
 
-fn print_system_info() {
-    let mut sys = System::new_all();
-    sys.refresh_memory();
-    let total_memory = sys.total_memory() / 1024 / 1024;
-    let available_memory = sys.available_memory() / 1024 / 1024;
-    let core_count = sys.cpus().len();
-    println!(
-        "{}",
-        format!(
-            "System Info: {} Cores, {}MB/{}MB Available Memory",
-            core_count, available_memory, total_memory
-        )
-        .dimmed()
-    );
-}
-
 fn write_css_optimized(path: &str, data: &[u8]) -> std::io::Result<()> {
     fs::write(path, data)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", "Starting DX Style Engine...".cyan());
-    print_system_info();
 
     if !Path::new("style.css").exists() {
         File::create("style.css")?;
