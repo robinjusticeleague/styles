@@ -22,7 +22,6 @@ which flatc
 flatc --version
 ```
 
-
 Organize this big files in these folders and give me all files in canvas mode correctly:
 
 ```md
