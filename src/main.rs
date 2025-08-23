@@ -210,7 +210,6 @@ fn rebuild_styles(
     }
     let css_write_duration = css_write_timer.elapsed();
 
-    // let wall_time = total_start.elapsed();
     let processing_time =
         parse_extract_duration + diff_duration + cache_update_duration + css_write_duration;
 
@@ -219,7 +218,6 @@ fn rebuild_styles(
         format!("{}", added.len()).green(),
         format!("{}", removed.len()).red(),
         old_hash_just_for_info,
-        // format_duration(wall_time),
         format_duration(processing_time),
         format_duration(parse_extract_duration),
         format_duration(diff_duration),

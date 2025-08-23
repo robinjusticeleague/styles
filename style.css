@@ -1,16 +1,39 @@
-.border {
+.flex {
   display: flex;
 }
-.text-6xl {
-  display: flex;
-}
-.bg-pink-500 {
-  display: flex;
-}
+
 .text-7xl {
   display: flex;
 }
+
 .text-9xl {
+  display: flex;
+}
+
+.text-pink-500 {
+  display: flex;
+}
+
+.border {
+  display: flex;
+}
+
+.text-6xl {
+  display: flex;
+}
+
+.bg-pink-500 {
+  display: flex;
+}
+
+.text-8xl {
+  display: flex;
+}
+
+.text-9xl {
+  display: flex;
+}
+.bg-pink-500 {
   display: flex;
 }
 .flex {
@@ -19,6 +42,15 @@
 .text-8xl {
   display: flex;
 }
+.text-6xl {
+  display: flex;
+}
 .text-pink-500 {
+  display: flex;
+}
+.border {
+  display: flex;
+}
+.text-7xl {
   display: flex;
 }
