@@ -214,11 +214,15 @@ fn rebuild_styles(
         parse_extract_duration + diff_duration + cache_update_duration + css_write_duration;
 
     println!(
-        "HASH({}) -> ({},{}) {}",
-        old_hash_just_for_info,
+        "Processed: {} added, {} removed (prev hash: {:x}) | (Total: {} -> Parse: {}, Diff: {}, Cache: {}, Write: {})",
         format!("{}", added.len()).green(),
         format!("{}", removed.len()).red(),
-        format_duration(processing_time).green(),
+        old_hash_just_for_info,
+        format_duration(processing_time),
+        format_duration(parse_extract_duration),
+        format_duration(diff_duration),
+        format_duration(cache_update_duration),
+        format_duration(css_write_duration)
     );
 
     Ok(())
