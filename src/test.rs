@@ -210,21 +210,14 @@ fn rebuild_styles(
     }
     let css_write_duration = css_write_timer.elapsed();
 
-    let wall_time = total_start.elapsed();
     let processing_time =
         parse_extract_duration + diff_duration + cache_update_duration + css_write_duration;
 
     println!(
-        "Processed: {} added, {} removed (prev hash: {:x}) | Wall: {} (Processing: {} [Parse: {}, Diff: {}, Cache: {}, CSS Write: {}])",
+        "({},{}) {}",
         format!("{}", added.len()).green(),
         format!("{}", removed.len()).red(),
-        old_hash_just_for_info,
-        format_duration(wall_time),
-        format_duration(processing_time),
-        format_duration(parse_extract_duration),
-        format_duration(diff_duration),
-        format_duration(cache_update_duration),
-        format_duration(css_write_duration)
+        format_duration(processing_time).green(),
     );
 
     Ok(())
