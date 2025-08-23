@@ -13,13 +13,7 @@ use std::time::{Duration, Instant};
 struct AppState {
     html_hash: u64,
     class_cache: AHashSet<String>,
-    css_hash: u64,
     css_file: BufWriter<File>,
-}
-
-fn write_css_append(writer: &mut BufWriter<File>, data: &[u8]) -> std::io::Result<()> {
-    writer.write_all(data)?;
-    writer.flush()
 }
 
 fn format_duration(duration: std::time::Duration) -> String {
@@ -99,7 +93,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_state = Arc::new(Mutex::new(AppState {
         html_hash: 0,
         class_cache: AHashSet::default(),
-        css_hash: 0,
         css_file: css_writer,
     }));
 
@@ -213,6 +206,7 @@ fn rebuild_styles(
             }
             state_guard.css_file.flush()?;
         }
+        
     }
     let css_write_duration = css_write_timer.elapsed();
 
