@@ -1,3 +1,5 @@
+// PART 1/2
+
 use ahash::{AHashSet, AHasher};
 use colored::Colorize;
 use cssparser::serialize_identifier;
@@ -14,12 +16,12 @@ struct AppState {
     html_hash: u64,
     class_cache: AHashSet<String>,
     css_hash: u64,
-    css_file: BufWriter<File>,
+    css_file: BufWriter<File>, // persistent file handle
 }
 
 fn write_css_append(writer: &mut BufWriter<File>, data: &[u8]) -> std::io::Result<()> {
     writer.write_all(data)?;
-    writer.flush()
+    writer.flush() // flush buffered data to disk
 }
 
 fn format_duration(duration: std::time::Duration) -> String {
@@ -124,6 +126,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// rebuild_styles is in PART 2
+// PART 2/2
+
 fn rebuild_styles(
     state: Arc<Mutex<AppState>>,
     is_initial_run: bool,
@@ -188,8 +193,9 @@ fn rebuild_styles(
         let mut state_guard = state.lock().unwrap();
 
         if !removed.is_empty() {
+            // Rebuild full file if any removals
             let classes: Vec<String> = state_guard.class_cache.iter().cloned().collect();
-            state_guard.css_file.get_mut().set_len(0)?;
+            state_guard.css_file.get_mut().set_len(0)?; // truncate
             state_guard.css_file.seek(SeekFrom::Start(0))?;
             let mut escaped = String::with_capacity(64);
             for class in classes {
@@ -201,6 +207,7 @@ fn rebuild_styles(
             }
             state_guard.css_file.flush()?;
         } else {
+            // Append only new rules
             let added_classes: Vec<String> = added.clone();
             state_guard.css_file.seek(SeekFrom::End(0))?;
             let mut escaped = String::with_capacity(64);
@@ -213,6 +220,7 @@ fn rebuild_styles(
             }
             state_guard.css_file.flush()?;
         }
+        
     }
     let css_write_duration = css_write_timer.elapsed();
 

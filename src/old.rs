@@ -3,9 +3,10 @@ use colored::Colorize;
 use cssparser::serialize_identifier;
 use memchr::{memchr, memmem::Finder};
 use notify_debouncer_full::new_debouncer;
-use std::fs::{File, OpenOptions};
+use rayon::prelude::*;
+use std::collections::BTreeMap;
+use std::fs::{self, File};
 use std::hash::Hasher;
-use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -13,22 +14,50 @@ use std::time::{Duration, Instant};
 struct AppState {
     html_hash: u64,
     class_cache: AHashSet<String>,
+    utility_css_cache: BTreeMap<String, String>,
     css_hash: u64,
-    css_file: BufWriter<File>,
 }
 
-fn write_css_append(writer: &mut BufWriter<File>, data: &[u8]) -> std::io::Result<()> {
-    writer.write_all(data)?;
-    writer.flush()
+fn write_css_optimized(path: &str, data: &[u8]) -> std::io::Result<()> {
+    fs::write(path, data)
 }
 
-fn format_duration(duration: std::time::Duration) -> String {
-    let micros = duration.as_micros();
-    if micros > 999 {
-        format!("{:.2}ms", micros as f64 / 1000.0)
-    } else {
-        format!("{}µs", micros)
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", "Starting DX Style Engine...".cyan());
+
+    if !Path::new("style.css").exists() {
+        File::create("style.css")?;
     }
+    if !Path::new("index.html").exists() {
+        File::create("index.html")?;
+    }
+
+    let app_state = Arc::new(Mutex::new(AppState {
+        html_hash: 0,
+        class_cache: AHashSet::default(),
+        utility_css_cache: BTreeMap::default(),
+        css_hash: 0,
+    }));
+
+    rebuild_styles(app_state.clone(), true)?;
+
+    let (tx, rx) = mpsc::channel();
+    let mut debouncer = new_debouncer(Duration::from_millis(1), None, tx)?;
+    debouncer.watch(Path::new("index.html"), notify::RecursiveMode::NonRecursive)?;
+    println!("{}", "Watching index.html for changes...".cyan());
+
+    for res in rx {
+        match res {
+            Ok(_) => {
+                if let Err(e) = rebuild_styles(app_state.clone(), false) {
+                    eprintln!("{} {}", "Error rebuilding styles:".red(), e);
+                }
+            }
+            Err(e) => eprintln!("{} {:?}", "Watch error:".red(), e),
+        }
+    }
+
+    Ok(())
 }
 
 fn extract_classes_fast(html_bytes: &[u8], capacity_hint: usize) -> AHashSet<String> {
@@ -69,7 +98,7 @@ fn extract_classes_fast(html_bytes: &[u8], capacity_hint: usize) -> AHashSet<Str
         if let Ok(value_str) = std::str::from_utf8(&html_bytes[value_start..value_end]) {
             for cls in value_str.split_whitespace() {
                 if !cls.is_empty() {
-                    set.insert(cls.to_owned());
+                    set.insert(cls.to_string());
                 }
             }
         }
@@ -79,58 +108,13 @@ fn extract_classes_fast(html_bytes: &[u8], capacity_hint: usize) -> AHashSet<Str
     set
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", "Starting DX Style Engine...".cyan());
-
-    if !Path::new("style.css").exists() {
-        File::create("style.css")?;
-    }
-    if !Path::new("index.html").exists() {
-        File::create("index.html")?;
-    }
-
-    let css_file = OpenOptions::new()
-        .write(true)
-        .truncate(false)
-        .create(true)
-        .open("style.css")?;
-    let css_writer = BufWriter::with_capacity(65536, css_file);
-
-    let app_state = Arc::new(Mutex::new(AppState {
-        html_hash: 0,
-        class_cache: AHashSet::default(),
-        css_hash: 0,
-        css_file: css_writer,
-    }));
-
-    rebuild_styles(app_state.clone(), true)?;
-
-    let (tx, rx) = mpsc::channel();
-    let mut debouncer = new_debouncer(Duration::from_millis(1), None, tx)?;
-    debouncer.watch(Path::new("index.html"), notify::RecursiveMode::NonRecursive)?;
-    println!("{}", "Watching index.html for changes...".cyan());
-
-    for res in rx {
-        match res {
-            Ok(_) => {
-                if let Err(e) = rebuild_styles(app_state.clone(), false) {
-                    eprintln!("{} {}", "Error rebuilding styles:".red(), e);
-                }
-            }
-            Err(e) => eprintln!("{} {:?}", "Watch error:".red(), e),
-        }
-    }
-
-    Ok(())
-}
-
 fn rebuild_styles(
     state: Arc<Mutex<AppState>>,
     is_initial_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let total_start = Instant::now();
 
-    let html_bytes = std::fs::read("index.html")?;
+    let html_bytes = fs::read("index.html")?;
 
     let new_html_hash = {
         let mut hasher = AHasher::default();
@@ -153,9 +137,15 @@ fn rebuild_styles(
     let diff_timer = Instant::now();
     let (added, removed, old_hash_just_for_info) = {
         let state_guard = state.lock().unwrap();
+
+        if !is_initial_run && state_guard.html_hash == new_html_hash {
+            return Ok(());
+        }
+
         let old = &state_guard.class_cache;
         let added: Vec<String> = all_classes.difference(old).cloned().collect();
         let removed: Vec<String> = old.difference(&all_classes).cloned().collect();
+
         (added, removed, state_guard.html_hash)
     };
     let diff_duration = diff_timer.elapsed();
@@ -163,56 +153,96 @@ fn rebuild_styles(
     if added.is_empty() && removed.is_empty() {
         let mut state_guard = state.lock().unwrap();
         state_guard.html_hash = new_html_hash;
+
+        let wall_time = total_start.elapsed();
+        let processing_time = parse_extract_duration + diff_duration;
         println!(
             "Processed: {} added, {} removed | Wall: {} (Processing: {} [Parse: {}, Diff: {}])",
             format!("{}", 0).green(),
             format!("{}", 0).red(),
-            format_duration(total_start.elapsed()),
-            format_duration(parse_extract_duration + diff_duration),
+            format_duration(wall_time),
+            format_duration(processing_time),
             format_duration(parse_extract_duration),
             format_duration(diff_duration),
         );
         return Ok(());
     }
 
+    const PAR_THRESHOLD: usize = 512;
     let cache_update_timer = Instant::now();
-    {
-        let mut state_guard = state.lock().unwrap();
-        state_guard.html_hash = new_html_hash;
-        state_guard.class_cache = all_classes.clone();
-    }
+    let new_rules: Vec<(String, String)> = if added.len() >= PAR_THRESHOLD {
+        added
+            .par_iter()
+            .map(|class| {
+                let mut escaped = String::with_capacity(class.len());
+                serialize_identifier(class, &mut escaped).unwrap();
+                let rule = format!(".{} {{\n  display: flex;\n}}", escaped);
+                (class.clone(), rule)
+            })
+            .collect()
+    } else {
+        let mut escaped = String::with_capacity(128);
+        added
+            .iter()
+            .map(|class| {
+                escaped.clear();
+                serialize_identifier(class, &mut escaped).unwrap();
+                let rule = format!(".{} {{\n  display: flex;\n}}", &escaped);
+                (class.clone(), rule)
+            })
+            .collect()
+    };
     let cache_update_duration = cache_update_timer.elapsed();
 
     let css_write_timer = Instant::now();
-    {
+    let css_bytes_opt = {
         let mut state_guard = state.lock().unwrap();
 
-        if !removed.is_empty() {
-            let classes: Vec<String> = state_guard.class_cache.iter().cloned().collect();
-            state_guard.css_file.get_mut().set_len(0)?;
-            state_guard.css_file.seek(SeekFrom::Start(0))?;
-            let mut escaped = String::with_capacity(64);
-            for class in classes {
-                state_guard.css_file.write_all(b".")?;
-                escaped.clear();
-                serialize_identifier(&class, &mut escaped).unwrap();
-                state_guard.css_file.write_all(escaped.as_bytes())?;
-                state_guard.css_file.write_all(b" {\n  display: flex;\n}\n")?;
-            }
-            state_guard.css_file.flush()?;
-        } else {
-            let added_classes: Vec<String> = added.clone();
-            state_guard.css_file.seek(SeekFrom::End(0))?;
-            let mut escaped = String::with_capacity(64);
-            for class in added_classes {
-                state_guard.css_file.write_all(b".")?;
-                escaped.clear();
-                serialize_identifier(&class, &mut escaped).unwrap();
-                state_guard.css_file.write_all(escaped.as_bytes())?;
-                state_guard.css_file.write_all(b" {\n  display: flex;\n}\n")?;
-            }
-            state_guard.css_file.flush()?;
+        state_guard.html_hash = new_html_hash;
+        state_guard.class_cache = all_classes;
+
+        for class in removed.iter() {
+            state_guard.utility_css_cache.remove(class);
         }
+        if !new_rules.is_empty() {
+            for (k, v) in new_rules {
+                state_guard.utility_css_cache.insert(k, v);
+            }
+        }
+
+        let n = state_guard.utility_css_cache.len();
+        let total_len: usize = if n >= PAR_THRESHOLD {
+            state_guard.utility_css_cache.par_iter().map(|(_, v)| v.len()).sum()
+        } else {
+            state_guard.utility_css_cache.values().map(|v| v.len()).sum()
+        };
+        let extra = if n > 0 { (n - 1) * 2 + 1 } else { 0 };
+
+        let mut css_buffer = Vec::with_capacity(total_len + extra);
+
+        let mut iter = state_guard.utility_css_cache.values();
+        if let Some(first) = iter.next() {
+            css_buffer.extend_from_slice(first.as_bytes());
+            for v in iter {
+                css_buffer.extend_from_slice(b"\n");
+                css_buffer.extend_from_slice(v.as_bytes());
+            }
+            css_buffer.push(b'\n');
+        }
+
+        let mut hasher = AHasher::default();
+        hasher.write(&css_buffer);
+        let new_css_hash = hasher.finish();
+        let css_changed_flag = is_initial_run || new_css_hash != state_guard.css_hash;
+        if css_changed_flag {
+            state_guard.css_hash = new_css_hash;
+            Some(css_buffer)
+        } else {
+            None
+        }
+    };
+    if let Some(css_bytes) = css_bytes_opt {
+        write_css_optimized("style.css", &css_bytes)?;
     }
     let css_write_duration = css_write_timer.elapsed();
 
@@ -234,4 +264,13 @@ fn rebuild_styles(
     );
 
     Ok(())
+}
+
+fn format_duration(duration: std::time::Duration) -> String {
+    let micros = duration.as_micros();
+    if micros > 999 {
+        format!("{:.2}ms", micros as f64 / 1000.0)
+    } else {
+        format!("{}µs", micros)
+    }
 }
