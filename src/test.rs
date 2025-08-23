@@ -214,7 +214,8 @@ fn rebuild_styles(
         parse_extract_duration + diff_duration + cache_update_duration + css_write_duration;
 
     println!(
-        "({},{}) {}",
+        "HASH({}) -> ({},{}) {}",
+        old_hash_just_for_info,
         format!("{}", added.len()).green(),
         format!("{}", removed.len()).red(),
         format_duration(processing_time).green(),
