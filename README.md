@@ -1,6 +1,146 @@
 # Dx
 Enhance Developer Experience
 
+```fbs
+Previosly this styles.fbs flatbuffers scheme file was for flatbuffers v23 but now update it for v25 lastest and remove all comments:
+
+```styles.fbs
+
+namespace StyleSchema;
+
+
+
+table Style {
+
+  name: string (key, required);
+
+  css: string (required);
+
+}
+
+
+
+table Generator {
+
+  prefix: string (key, required);
+
+  property: string (required);
+
+  multiplier: float;
+
+  unit: string (required);
+
+}
+
+
+
+table Dynamic {
+
+  key: string (key, required);
+
+  property: string (required);
+
+  values: [DynamicValue];
+
+}
+
+
+
+table DynamicValue {
+
+    suffix: string (key, required);
+
+    value: string (required);
+
+}
+
+
+
+table Screen {
+
+    name: string (key, required);
+
+    value: string (required);
+
+}
+
+
+
+table State {
+
+    name: string (key, required);
+
+    value: string (required);
+
+}
+
+
+
+table ContainerQuery {
+
+    name: string (key, required);
+
+    value: string (required);
+
+}
+
+
+
+// New color tokens table. Each color has a name and a value (e.g. hex, rgb(), hsl()).
+
+table Color {
+
+  name: string (key, required);
+
+  value: string (required);
+
+}
+
+
+
+// Animation generator templates describe how to expand animation-related
+
+// utility classes into CSS. Templates can include placeholders like:
+
+// {hash}, {value1}, {value2}, {rules}, {perc}
+
+table AnimationGenerator {
+
+  name: string (key, required);
+
+  template: string (required);
+
+}
+
+
+
+table Config {
+
+  styles: [Style];
+
+  generators: [Generator];
+
+  dynamics: [Dynamic];
+
+  screens: [Screen];
+
+  states: [State];
+
+  container_queries: [ContainerQuery];
+
+  colors: [Color]; // Added in schema v2
+
+  animation_generators: [AnimationGenerator]; // Added in schema v3
+
+}
+
+
+
+root_type Config;
+
+```
+```
+
 ```bash
 cargo add ahash colored cssparser memchr notify_debouncer_full rayon notify
 git clone https://github.com/google/flatbuffers.git
