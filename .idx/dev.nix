@@ -1,13 +1,12 @@
 { pkgs, ... }: {
-  channel = "stable-24.05";
+  channel = "unstable";
   packages = [
     pkgs.gcc
     pkgs.rustup
     pkgs.bun
-    pkgs.tree
     pkgs.gnumake
     pkgs.cmake
-    pkgs.sudo
+    pkgs.flatbuffers
   ];
   env = { };
   idx = {
