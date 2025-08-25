@@ -5,16 +5,16 @@ use std::io::BufWriter;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-mod engine;
+mod core;
 mod generator;
 mod parser;
 mod telemetry;
 mod watcher;
 
-use engine::{rebuild_styles, AppState};
+use core::{rebuild_styles, AppState};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", "Starting DX Style Engine...".cyan());
+    println!("{}", "Starting DX Style core...".cyan());
 
     if !Path::new("style.css").exists() {
         File::create("style.css")?;

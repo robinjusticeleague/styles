@@ -18,7 +18,6 @@ pub fn write_css(
     for class in classes_to_write {
         css_file.write_all(b".")?;
         escaped.clear();
-        // This unwrap is safe as long as the identifier is valid CSS.
         serialize_identifier(&class, &mut escaped).unwrap();
         css_file.write_all(escaped.as_bytes())?;
         css_file.write_all(b" {\n  display: flex;\n}\n")?;

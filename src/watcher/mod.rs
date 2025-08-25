@@ -1,4 +1,4 @@
-use crate::engine::{rebuild_styles, AppState};
+use crate::core::{rebuild_styles, AppState};
 use colored::Colorize;
 use notify::{RecursiveMode};
 use notify_debouncer_full::new_debouncer;
