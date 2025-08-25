@@ -123,13 +123,17 @@ fn rebuild_styles(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let total_start = Instant::now();
 
+    let read_timer = Instant::now();
     let html_bytes = std::fs::read("index.html")?;
+    let read_duration = read_timer.elapsed();
 
+    let hash_timer = Instant::now();
     let new_html_hash = {
         let mut hasher = AHasher::default();
         hasher.write(&html_bytes);
         hasher.finish()
     };
+    let hash_duration = hash_timer.elapsed();
 
     {
         let state_guard = state.lock().unwrap();
@@ -142,6 +146,13 @@ fn rebuild_styles(
     let prev_len_hint = { state.lock().unwrap().class_cache.len() };
     let all_classes = extract_classes_fast(&html_bytes, prev_len_hint.next_power_of_two());
     let parse_extract_duration = parse_timer.elapsed();
+
+    {
+        let state_guard = state.lock().unwrap();
+        if all_classes.is_empty() && !state_guard.class_cache.is_empty() {
+            return Ok(());
+        }
+    }
 
     let diff_timer = Instant::now();
     let (added, removed, old_hash_just_for_info) = {
@@ -156,15 +167,6 @@ fn rebuild_styles(
     if added.is_empty() && removed.is_empty() {
         let mut state_guard = state.lock().unwrap();
         state_guard.html_hash = new_html_hash;
-        println!(
-            "Processed: {} added, {} removed | Wall: {} (Processing: {} [Parse: {}, Diff: {}])",
-            format!("{}", 0).green(),
-            format!("{}", 0).red(),
-            format_duration(total_start.elapsed()),
-            format_duration(parse_extract_duration + diff_duration),
-            format_duration(parse_extract_duration),
-            format_duration(diff_duration),
-        );
         return Ok(());
     }
 
@@ -192,7 +194,6 @@ fn rebuild_styles(
                 state_guard.css_file.write_all(escaped.as_bytes())?;
                 state_guard.css_file.write_all(b" {\n  display: flex;\n}\n")?;
             }
-            state_guard.css_file.flush()?;
         } else {
             let added_classes: Vec<String> = added.clone();
             state_guard.css_file.seek(SeekFrom::End(0))?;
@@ -204,21 +205,19 @@ fn rebuild_styles(
                 state_guard.css_file.write_all(escaped.as_bytes())?;
                 state_guard.css_file.write_all(b" {\n  display: flex;\n}\n")?;
             }
-            state_guard.css_file.flush()?;
         }
-        
+        state_guard.css_file.flush()?;
     }
     let css_write_duration = css_write_timer.elapsed();
 
-    let processing_time =
-        parse_extract_duration + diff_duration + cache_update_duration + css_write_duration;
-
     println!(
-        "Processed: {} added, {} removed (prev hash: {:x}) | (Total: {} -> Parse: {}, Diff: {}, Cache: {}, Write: {})",
+        "Processed: {} added, {} removed (prev hash: {:x}) | (Total: {} -> Read: {}, Hash: {}, Parse: {}, Diff: {}, Cache: {}, Write: {})",
         format!("{}", added.len()).green(),
         format!("{}", removed.len()).red(),
         old_hash_just_for_info,
-        format_duration(processing_time),
+        format_duration(total_start.elapsed()),
+        format_duration(read_duration),
+        format_duration(hash_duration),
         format_duration(parse_extract_duration),
         format_duration(diff_duration),
         format_duration(cache_update_duration),
