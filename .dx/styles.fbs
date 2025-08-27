@@ -38,15 +38,11 @@ table ContainerQuery {
     value: string (required);
 }
 
-// New color tokens table. Each color has a name and a value (e.g. hex, rgb(), hsl()).
 table Color {
   name: string (key, required);
   value: string (required);
 }
 
-// Animation generator templates describe how to expand animation-related
-// utility classes into CSS. Templates can include placeholders like:
-// {hash}, {value1}, {value2}, {rules}, {perc}
 table AnimationGenerator {
   name: string (key, required);
   template: string (required);
@@ -59,8 +55,8 @@ table Config {
   screens: [Screen];
   states: [State];
   container_queries: [ContainerQuery];
-  colors: [Color]; // Added in schema v2
-  animation_generators: [AnimationGenerator]; // Added in schema v3
+  colors: [Color];
+  animation_generators: [AnimationGenerator];
 }
 
 root_type Config;
