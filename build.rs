@@ -31,8 +31,8 @@ struct GeneratorConfig {
 }
 
 fn main() {
-    let fbs_files = [".dx/styles.fbs"];
-    let toml_path = ".dx/styles.toml";
+    let fbs_files = [".dx/style.fbs"];
+    let toml_path = ".dx/style.toml";
     let out_dir = std::env::var("OUT_DIR").unwrap();
 
     for fbs_file in fbs_files.iter() {
@@ -199,7 +199,7 @@ fn main() {
     builder.finish(config_root, None);
 
     let buf = builder.finished_data();
-    let styles_bin_path = Path::new(".dx/styles.bin");
+    let styles_bin_path = Path::new(".dx/style.bin");
     fs::create_dir_all(styles_bin_path.parent().unwrap()).expect("Failed to create .dx directory");
     fs::write(styles_bin_path, buf).expect("Failed to write styles.bin");
 }
