@@ -1,10 +1,4 @@
 target
 modules
-v23.5.26.tar.gz
-flatbuffers-23.5.26
-.dx/*
-.dx/cache
-inspiration
 node_modules
-flatbuffers
-trash
+./trash
