@@ -31,8 +31,8 @@ struct GeneratorConfig {
 }
 
 fn main() {
-    let fbs_files = ["styles.fbs"];
-    let toml_path = "styles.toml";
+    let fbs_files = [".dx/styles.fbs"];
+    let toml_path = ".dx/styles.toml";
     let out_dir = std::env::var("OUT_DIR").unwrap();
 
     for fbs_file in fbs_files.iter() {
