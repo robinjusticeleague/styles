@@ -20,7 +20,7 @@ pub fn rebuild_styles(
     let total_start = Instant::now();
 
     let read_timer = Instant::now();
-    let html_bytes = std::fs::read("index.html")?;
+    let html_bytes = std::fs::read("playgrounds/html/index.html")?;
     let read_duration = read_timer.elapsed();
 
     let hash_timer = Instant::now();
