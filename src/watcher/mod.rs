@@ -11,9 +11,9 @@ pub fn start(state: Arc<Mutex<AppState>>) -> Result<(), Box<dyn std::error::Erro
     let mut debouncer = new_debouncer(Duration::from_millis(1), None, tx)?;
 
     debouncer
-        .watch(Path::new("playgrounds/html/index.html"), RecursiveMode::NonRecursive)?;
+        .watch(Path::new("./playgrounds/html/index.html"), RecursiveMode::NonRecursive)?;
         
-    println!("{}", "Watching playgrounds/html/index.html for changes...".cyan());
+    println!("{}", "Watching ./playgrounds/html/index.html for changes...".cyan());
 
     for res in rx {
         match res {
